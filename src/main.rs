@@ -269,12 +269,9 @@ fn main() -> Result<()> {
             );
         }
         Commands::UseBest(args) => {
-            if !args.dry_run {
-                acquire_use_best_lock(&ctx)?;
-            }
             let results = probe_accounts(&ctx)?;
             save_cache(&ctx, &results)?;
-            let selected = select_best(&results, args.min_primary_left)?;
+            let selected = select_best_candidate(&ctx, &results, args.min_primary_left, !args.dry_run)?;
             if args.dry_run {
                 print_use_best_preview(selected);
             } else {
@@ -969,23 +966,32 @@ fn resolve_selector<'a>(results: &'a [AccountProbeResult], selector: &str) -> Re
     }
 }
 
-fn select_best(results: &[AccountProbeResult], min_primary_left: f64) -> Result<&AccountProbeResult> {
-    let eligible: Vec<&AccountProbeResult> = results
-        .iter()
-        .filter(|result| matches!(result.status, ProbeStatus::Ok))
-        .filter(|result| result.primary.as_ref().map(|item| item.left_percent).unwrap_or(0.0) >= min_primary_left)
-        .collect();
+fn select_best_candidate<'a>(
+    ctx: &AppContext,
+    results: &'a [AccountProbeResult],
+    min_primary_left: f64,
+    claim: bool,
+) -> Result<&'a AccountProbeResult> {
+    let candidates = rank_best_candidates(results, min_primary_left);
+    if candidates.is_empty() {
+        bail!("no account satisfied the requested minimum primary limit");
+    }
 
-    let preferred: Vec<&AccountProbeResult> = eligible
-        .iter()
-        .copied()
-        .filter(|result| is_preferred_candidate(result))
-        .collect();
-    let pool = if preferred.is_empty() { eligible } else { preferred };
+    let fallback = candidates.first().copied().unwrap();
+    for candidate in candidates {
+        if account_is_cooled_down(ctx, candidate)? {
+            continue;
+        }
+        if claim {
+            if claim_account_cooldown(ctx, candidate)? {
+                return Ok(candidate);
+            }
+        } else {
+            return Ok(candidate);
+        }
+    }
 
-    pool.into_iter()
-        .max_by(|left, right| compare_best_candidate(left, right))
-        .ok_or_else(|| anyhow!("no account satisfied the requested minimum primary limit"))
+    Ok(fallback)
 }
 
 fn compare_best_candidate(left: &AccountProbeResult, right: &AccountProbeResult) -> Ordering {
@@ -1003,23 +1009,53 @@ fn compare_best_candidate(left: &AccountProbeResult, right: &AccountProbeResult)
         .then_with(|| right.auth_file.cmp(&left.auth_file))
 }
 
+fn rank_best_candidates<'a>(
+    results: &'a [AccountProbeResult],
+    min_primary_left: f64,
+) -> Vec<&'a AccountProbeResult> {
+    let mut candidates: Vec<&AccountProbeResult> = results
+        .iter()
+        .filter(|result| matches!(result.status, ProbeStatus::Ok))
+        .filter(|result| primary_left_percent(result) >= min_primary_left)
+        .collect();
+    candidates.sort_by(|left, right| compare_best_candidate(right, left));
+    candidates
+}
+
 fn stdout_is_tty() -> bool {
     std::io::stdout().is_terminal()
 }
 
-fn use_best_lock_path(ctx: &AppContext) -> PathBuf {
-    ctx.tmp_root.join("use-best.lock")
+fn account_cooldown_path(ctx: &AppContext, result: &AccountProbeResult) -> PathBuf {
+    ctx.tmp_root
+        .join("use-best")
+        .join(format!("{}.lock", sanitize_account_name(&result.auth_file)))
 }
 
-fn acquire_use_best_lock(ctx: &AppContext) -> Result<()> {
-    acquire_timed_lock(&use_best_lock_path(ctx), Duration::from_secs(USE_BEST_LOCK_TTL_SECS))
+fn claim_account_cooldown(ctx: &AppContext, result: &AccountProbeResult) -> Result<bool> {
+    acquire_timed_lock(
+        &account_cooldown_path(ctx, result),
+        Duration::from_secs(USE_BEST_LOCK_TTL_SECS),
+    )
 }
 
-fn acquire_timed_lock(lock_path: &Path, ttl: Duration) -> Result<()> {
+fn account_is_cooled_down(ctx: &AppContext, result: &AccountProbeResult) -> Result<bool> {
+    let lock_path = account_cooldown_path(ctx, result);
+    match read_lock_state(&lock_path)? {
+        Some(state) if state.expires_at > chrono::Utc::now().timestamp() => Ok(true),
+        _ => Ok(false),
+    }
+}
+
+fn acquire_timed_lock(lock_path: &Path, ttl: Duration) -> Result<bool> {
     let now = chrono::Utc::now().timestamp();
     let expires_at = now + i64::try_from(ttl.as_secs()).unwrap_or(i64::MAX - now);
 
     loop {
+        if let Some(parent) = lock_path.parent() {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("failed to create lock directory {}", parent.display()))?;
+        }
         match fs::OpenOptions::new()
             .write(true)
             .create_new(true)
@@ -1036,15 +1072,12 @@ fn acquire_timed_lock(lock_path: &Path, ttl: Duration) -> Result<()> {
                     .with_context(|| format!("failed to write lock file {}", lock_path.display()))?;
                 file.sync_all()
                     .with_context(|| format!("failed to flush lock file {}", lock_path.display()))?;
-                return Ok(());
+                return Ok(true);
             }
             Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
                 match read_lock_state(lock_path)? {
                     Some(state) if state.expires_at > now => {
-                        bail!(
-                            "use-best is temporarily locked until {}",
-                            format_timestamp(state.expires_at)
-                        );
+                        return Ok(false);
                     }
                     _ => {
                         let _ = fs::remove_file(lock_path);
@@ -1052,7 +1085,8 @@ fn acquire_timed_lock(lock_path: &Path, ttl: Duration) -> Result<()> {
                 }
             }
             Err(err) => {
-                return Err(err).with_context(|| format!("failed to create lock file {}", lock_path.display()));
+                return Err(err)
+                    .with_context(|| format!("failed to create lock file {}", lock_path.display()));
             }
         }
     }
@@ -1070,13 +1104,6 @@ fn read_lock_state(lock_path: &Path) -> Result<Option<UseBestLockState>> {
     match serde_json::from_str(&raw) {
         Ok(state) => Ok(Some(state)),
         Err(_) => Ok(None),
-    }
-}
-
-fn format_timestamp(timestamp: i64) -> String {
-    match Local.timestamp_opt(timestamp, 0).single() {
-        Some(time) => time.format("%d %b %H:%M").to_string(),
-        None => timestamp.to_string(),
     }
 }
 
@@ -1261,6 +1288,16 @@ fn codex_version() -> Option<String> {
 mod tests {
     use super::*;
 
+    fn sample_ctx(tempdir: &tempfile::TempDir) -> AppContext {
+        let codex_root = tempdir.path().join("codex");
+        AppContext {
+            codex_root: codex_root.clone(),
+            accounts_root: codex_root.join("accounts"),
+            tmp_root: codex_root.join("tmp"),
+            cache_path: codex_root.join("tmp/cache.json"),
+        }
+    }
+
     fn sample_window(left_percent: f64) -> WindowSummary {
         WindowSummary {
             used_percent: (100.0 - left_percent).max(0.0),
@@ -1285,36 +1322,54 @@ mod tests {
         }
     }
 
+    fn lock_account(result: &AccountProbeResult, expires_at: i64, tempdir: &tempfile::TempDir) {
+        let ctx = sample_ctx(tempdir);
+        let lock_path = account_cooldown_path(&ctx, result);
+        fs::create_dir_all(lock_path.parent().unwrap()).unwrap();
+        let lock = UseBestLockState {
+            created_at: expires_at - 300,
+            expires_at,
+            pid: 1234,
+        };
+        fs::write(&lock_path, serde_json::to_string_pretty(&lock).unwrap()).unwrap();
+    }
+
     #[test]
     fn select_best_prefers_weekly_above_floor() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let ctx = sample_ctx(&tempdir);
         let results = vec![
             sample_result("fallback.json", 100.0, 20.0),
             sample_result("preferred.json", 80.0, 60.0),
         ];
 
-        let selected = select_best(&results, 0.0).unwrap();
+        let selected = select_best_candidate(&ctx, &results, 0.0, false).unwrap();
         assert_eq!(selected.auth_file, "preferred.json");
     }
 
     #[test]
     fn select_best_falls_back_when_everything_is_below_weekly_floor() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let ctx = sample_ctx(&tempdir);
         let results = vec![
             sample_result("best-primary.json", 100.0, 20.0),
             sample_result("worse-primary.json", 95.0, 5.0),
         ];
 
-        let selected = select_best(&results, 0.0).unwrap();
+        let selected = select_best_candidate(&ctx, &results, 0.0, false).unwrap();
         assert_eq!(selected.auth_file, "best-primary.json");
     }
 
     #[test]
     fn select_best_respects_primary_floor() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let ctx = sample_ctx(&tempdir);
         let results = vec![
             sample_result("a.json", 80.0, 60.0),
             sample_result("b.json", 90.0, 60.0),
         ];
 
-        let err = select_best(&results, 95.0).unwrap_err();
+        let err = select_best_candidate(&ctx, &results, 95.0, false).unwrap_err();
         assert!(err.to_string().contains("requested minimum primary limit"));
     }
 
@@ -1330,37 +1385,35 @@ mod tests {
     }
 
     #[test]
-    fn acquire_timed_lock_blocks_active_lock() {
+    fn claiming_best_account_locks_it_for_the_next_run() {
         let tempdir = tempfile::tempdir().unwrap();
-        let lock_path = tempdir.path().join("use-best.lock");
-        let now = chrono::Utc::now().timestamp();
-        let lock = UseBestLockState {
-            created_at: now - 5,
-            expires_at: now + 300,
-            pid: 1234,
-        };
-        fs::write(&lock_path, serde_json::to_string_pretty(&lock).unwrap()).unwrap();
+        let ctx = sample_ctx(&tempdir);
+        let results = vec![
+            sample_result("best.json", 100.0, 60.0),
+            sample_result("backup.json", 90.0, 55.0),
+        ];
 
-        let err = acquire_timed_lock(&lock_path, Duration::from_secs(USE_BEST_LOCK_TTL_SECS))
-            .unwrap_err();
-        assert!(err.to_string().contains("temporarily locked"));
+        let first = select_best_candidate(&ctx, &results, 0.0, true).unwrap();
+        assert_eq!(first.auth_file, "best.json");
+
+        let second = select_best_candidate(&ctx, &results, 0.0, true).unwrap();
+        assert_eq!(second.auth_file, "backup.json");
     }
 
     #[test]
-    fn acquire_timed_lock_replaces_expired_lock() {
+    fn select_best_falls_back_to_locked_account_when_everything_is_locked() {
         let tempdir = tempfile::tempdir().unwrap();
-        let lock_path = tempdir.path().join("use-best.lock");
         let now = chrono::Utc::now().timestamp();
-        let stale = UseBestLockState {
-            created_at: now - 600,
-            expires_at: now - 1,
-            pid: 1234,
-        };
-        fs::write(&lock_path, serde_json::to_string_pretty(&stale).unwrap()).unwrap();
+        let ctx = sample_ctx(&tempdir);
+        let results = vec![
+            sample_result("best.json", 100.0, 60.0),
+            sample_result("backup.json", 90.0, 55.0),
+        ];
 
-        acquire_timed_lock(&lock_path, Duration::from_secs(USE_BEST_LOCK_TTL_SECS)).unwrap();
-        let raw = fs::read_to_string(&lock_path).unwrap();
-        let fresh: UseBestLockState = serde_json::from_str(&raw).unwrap();
-        assert!(fresh.expires_at > now);
+        lock_account(&results[0], now + 300, &tempdir);
+        lock_account(&results[1], now + 300, &tempdir);
+
+        let selected = select_best_candidate(&ctx, &results, 0.0, false).unwrap();
+        assert_eq!(selected.auth_file, "best.json");
     }
 }

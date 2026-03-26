@@ -20,7 +20,7 @@ delta.user_at_example.com.json       delta.user@example.com    team       0%  22
 
 `*` means: this account matches the currently active `~/.codex/auth.json`.
 
-`use-best` prefers accounts with at least `25%` weekly left. If nothing clears that bar, it falls back to the best remaining account. After a successful run, the command is cooled down for 5 minutes so another terminal cannot immediately flip `~/.codex/auth.json` again.
+`use-best` prefers accounts with at least `25%` weekly left. If nothing clears that bar, it falls back to the best remaining account. After a successful run, the chosen account is cooled down for 5 minutes so another terminal will pick something else first. If every candidate is already cooled down, it can fall back to the same account.
 
 When you run the CLI in a real terminal, the human-readable output is colorized. `--json` stays plain.
 
