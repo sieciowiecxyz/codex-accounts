@@ -20,6 +20,10 @@ delta.user_at_example.com.json       delta.user@example.com    team       0%  22
 
 `*` means: this account matches the currently active `~/.codex/auth.json`.
 
+`use-best` prefers accounts with at least `25%` weekly left. If nothing clears that bar, it falls back to the best remaining account. After a successful run, the command is cooled down for 5 minutes so another terminal cannot immediately flip `~/.codex/auth.json` again.
+
+When you run the CLI in a real terminal, the human-readable output is colorized. `--json` stays plain.
+
 ## Typical Flow
 
 ```bash
@@ -72,7 +76,7 @@ codex-accounts import-new
 From this repo:
 
 ```bash
-cargo install --path .
+cargo install --path . --force --locked
 ```
 
 If `cargo` installs into `~/.cargo/bin` and that is not in your `PATH`, either add it:
@@ -83,10 +87,12 @@ export PATH="$HOME/.cargo/bin:$PATH"
 
 or symlink the binary into a directory already in `PATH`.
 
+If you already installed `codex-accounts` before, rerun the same command with `--force` to update the system binary in place.
+
 ## Quick Start
 
 ```bash
-cargo install --path .
+cargo install --path . --force --locked
 codex-accounts doctor
 codex-accounts list --refresh
 codex-accounts use-best --dry-run
