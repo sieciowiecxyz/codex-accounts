@@ -42,10 +42,10 @@ struct Cli {
 #[derive(Subcommand, Debug)]
 enum Commands {
     List(ListArgs),
-    Use(UseArgs),
+    Use(SelectorArgs),
     UseBest(UseBestArgs),
     ImportNew,
-    Doctor,
+    Remove(SelectorArgs),
 }
 
 #[derive(Args, Debug, Clone)]
@@ -57,7 +57,7 @@ struct ListArgs {
 }
 
 #[derive(Args, Debug)]
-struct UseArgs {
+struct SelectorArgs {
     selector: String,
 }
 
@@ -130,16 +130,6 @@ struct UseBestLockState {
 enum ProbeStatus {
     Ok,
     Error(String),
-}
-
-#[derive(Debug, Serialize)]
-struct DoctorReport {
-    codex_root: PathBuf,
-    accounts_root: PathBuf,
-    codex_path: Option<PathBuf>,
-    codex_version: Option<String>,
-    auth_files_found: usize,
-    cache_path: PathBuf,
 }
 
 #[derive(Debug, Serialize)]
@@ -228,12 +218,19 @@ impl ChildGuard {
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()
-            .with_context(|| format!("failed to start codex app-server for {}", codex_home.display()))?;
+            .with_context(|| {
+                format!(
+                    "failed to start codex app-server for {}",
+                    codex_home.display()
+                )
+            })?;
         Ok(Self { child })
     }
 
     fn try_wait(&mut self) -> Result<Option<std::process::ExitStatus>> {
-        self.child.try_wait().context("failed to inspect codex app-server status")
+        self.child
+            .try_wait()
+            .context("failed to inspect codex app-server status")
     }
 }
 
@@ -248,7 +245,10 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
     let ctx = app_context()?;
 
-    match cli.command.unwrap_or(Commands::List(ListArgs { json: false, refresh: false })) {
+    match cli.command.unwrap_or(Commands::List(ListArgs {
+        json: false,
+        refresh: false,
+    })) {
         Commands::List(args) => {
             let results = load_or_probe(&ctx, args.refresh)?;
             if args.json {
@@ -264,14 +264,24 @@ fn main() -> Result<()> {
             clear_cache(&ctx)?;
             println!(
                 "Switched to {} ({})",
-                selected.auth_file,
-                selected.account_label
+                selected.auth_file, selected.account_label
+            );
+        }
+        Commands::Remove(args) => {
+            let results = load_or_probe(&ctx, false)?;
+            let selected = resolve_selector(&results, &args.selector)?;
+            remove_selected(selected)?;
+            clear_cache(&ctx)?;
+            println!(
+                "Removed account: {} ({})",
+                selected.auth_file, selected.account_label
             );
         }
         Commands::UseBest(args) => {
             let results = probe_accounts(&ctx)?;
             save_cache(&ctx, &results)?;
-            let selected = select_best_candidate(&ctx, &results, args.min_primary_left, !args.dry_run)?;
+            let selected =
+                select_best_candidate(&ctx, &results, args.min_primary_left, !args.dry_run)?;
             if args.dry_run {
                 print_use_best_preview(selected);
             } else {
@@ -279,22 +289,9 @@ fn main() -> Result<()> {
                 clear_cache(&ctx)?;
                 println!(
                     "Switched to best account: {} ({})",
-                    selected.auth_file,
-                    selected.account_label
+                    selected.auth_file, selected.account_label
                 );
             }
-        }
-        Commands::Doctor => {
-            let auth_files = discover_auth_files(&ctx)?;
-            let report = DoctorReport {
-                codex_root: ctx.codex_root.clone(),
-                accounts_root: ctx.accounts_root.clone(),
-                codex_path: find_codex_path(),
-                codex_version: codex_version(),
-                auth_files_found: auth_files.len(),
-                cache_path: ctx.cache_path.clone(),
-            };
-            println!("{}", serde_json::to_string_pretty(&report)?);
         }
         Commands::ImportNew => {
             let stored_path = import_new_account(&ctx)?;
@@ -437,8 +434,8 @@ where
         if !predicate(file_name) {
             continue;
         }
-        let bytes =
-            fs::read(&path).with_context(|| format!("failed to read auth file {}", path.display()))?;
+        let bytes = fs::read(&path)
+            .with_context(|| format!("failed to read auth file {}", path.display()))?;
         let is_current = current_auth_bytes
             .as_ref()
             .map(|current| current == &bytes)
@@ -546,9 +543,7 @@ fn probe_single_auth_inner(ctx: &AppContext, auth_file: &AuthFile) -> Result<Acc
 
     let (account_label, email, plan_type) = match account.account {
         Some(AccountInfo::ApiKey) => ("apiKey".to_string(), None, None),
-        Some(AccountInfo::Chatgpt { email, plan_type }) => {
-            (email.clone(), Some(email), plan_type)
-        }
+        Some(AccountInfo::Chatgpt { email, plan_type }) => (email.clone(), Some(email), plan_type),
         None => ("<unknown>".to_string(), None, None),
     };
 
@@ -563,17 +558,21 @@ fn probe_single_auth_inner(ctx: &AppContext, auth_file: &AuthFile) -> Result<Acc
         plan_type,
         primary: rate_limits.rate_limits.primary.map(window_summary),
         secondary: rate_limits.rate_limits.secondary.map(window_summary),
-        credits: rate_limits.rate_limits.credits.map(|credits| CreditsSummary {
-            has_credits: credits.has_credits,
-            unlimited: credits.unlimited,
-            balance: credits.balance,
-        }),
+        credits: rate_limits
+            .rate_limits
+            .credits
+            .map(|credits| CreditsSummary {
+                has_credits: credits.has_credits,
+                unlimited: credits.unlimited,
+                balance: credits.balance,
+            }),
         status: ProbeStatus::Ok,
     })
 }
 
 fn reserve_port() -> Result<u16> {
-    let listener = TcpListener::bind(("127.0.0.1", 0)).context("failed to reserve localhost port")?;
+    let listener =
+        TcpListener::bind(("127.0.0.1", 0)).context("failed to reserve localhost port")?;
     let port = listener
         .local_addr()
         .context("failed to inspect reserved localhost port")?
@@ -615,7 +614,12 @@ fn connect_when_ready(port: u16, child: &mut ChildGuard) -> Result<WebSocket<Tcp
     Err(last_error.unwrap_or_else(|| anyhow!("timed out waiting for codex app-server")))
 }
 
-fn rpc_request<P, R>(websocket: &mut WebSocket<TcpStream>, id: u64, method: &str, params: P) -> Result<R>
+fn rpc_request<P, R>(
+    websocket: &mut WebSocket<TcpStream>,
+    id: u64,
+    method: &str,
+    params: P,
+) -> Result<R>
 where
     P: Serialize,
     R: DeserializeOwned,
@@ -626,7 +630,9 @@ where
         .with_context(|| format!("failed to send RPC request {method}"))?;
 
     loop {
-        let message = websocket.read().with_context(|| format!("failed to read RPC response for {method}"))?;
+        let message = websocket
+            .read()
+            .with_context(|| format!("failed to read RPC response for {method}"))?;
         match message {
             Message::Text(text) => {
                 let value: Value = serde_json::from_str(&text)
@@ -765,7 +771,13 @@ fn print_table(results: &[AccountProbeResult]) {
             ),
             render_plain_cell(&row[6], widths[6], false, color_enabled, None),
             render_plain_cell(&row[7], widths[7], false, color_enabled, None),
-            render_plain_cell(&row[8], widths[8], false, color_enabled, Some(status_color(&result.status))),
+            render_plain_cell(
+                &row[8],
+                widths[8],
+                false,
+                color_enabled,
+                Some(status_color(&result.status))
+            ),
         );
     }
 }
@@ -862,7 +874,9 @@ fn format_reset(window: Option<&WindowSummary>) -> String {
 fn format_credits(credits: Option<&CreditsSummary>) -> String {
     match credits {
         Some(credits) if credits.unlimited => "unlimited".to_string(),
-        Some(credits) if credits.has_credits => credits.balance.clone().unwrap_or_else(|| "yes".to_string()),
+        Some(credits) if credits.has_credits => {
+            credits.balance.clone().unwrap_or_else(|| "yes".to_string())
+        }
         Some(_) => "-".to_string(),
         None => "-".to_string(),
     }
@@ -893,11 +907,19 @@ fn color_for_percent(left_percent: f64) -> &'static str {
 }
 
 fn primary_left_percent(result: &AccountProbeResult) -> f64 {
-    result.primary.as_ref().map(|item| item.left_percent).unwrap_or(0.0)
+    result
+        .primary
+        .as_ref()
+        .map(|item| item.left_percent)
+        .unwrap_or(0.0)
 }
 
 fn secondary_left_percent(result: &AccountProbeResult) -> f64 {
-    result.secondary.as_ref().map(|item| item.left_percent).unwrap_or(0.0)
+    result
+        .secondary
+        .as_ref()
+        .map(|item| item.left_percent)
+        .unwrap_or(0.0)
 }
 
 fn is_preferred_candidate(result: &AccountProbeResult) -> bool {
@@ -924,7 +946,10 @@ fn truncate(text: &str, max_len: usize) -> String {
     }
 }
 
-fn resolve_selector<'a>(results: &'a [AccountProbeResult], selector: &str) -> Result<&'a AccountProbeResult> {
+fn resolve_selector<'a>(
+    results: &'a [AccountProbeResult],
+    selector: &str,
+) -> Result<&'a AccountProbeResult> {
     let selector_lower = selector.to_lowercase();
 
     let exact_matches: Vec<_> = results
@@ -950,7 +975,9 @@ fn resolve_selector<'a>(results: &'a [AccountProbeResult], selector: &str) -> Re
         .iter()
         .filter(|result| {
             result.auth_file.to_lowercase().contains(&selector_lower)
-                || auth_stem(&result.auth_file).to_lowercase().contains(&selector_lower)
+                || auth_stem(&result.auth_file)
+                    .to_lowercase()
+                    .contains(&selector_lower)
                 || result
                     .email
                     .as_deref()
@@ -1068,10 +1095,12 @@ fn acquire_timed_lock(lock_path: &Path, ttl: Duration) -> Result<bool> {
                     pid: std::process::id(),
                 };
                 let text = serde_json::to_string_pretty(&state)?;
-                file.write_all(text.as_bytes())
-                    .with_context(|| format!("failed to write lock file {}", lock_path.display()))?;
-                file.sync_all()
-                    .with_context(|| format!("failed to flush lock file {}", lock_path.display()))?;
+                file.write_all(text.as_bytes()).with_context(|| {
+                    format!("failed to write lock file {}", lock_path.display())
+                })?;
+                file.sync_all().with_context(|| {
+                    format!("failed to flush lock file {}", lock_path.display())
+                })?;
                 return Ok(true);
             }
             Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
@@ -1085,8 +1114,9 @@ fn acquire_timed_lock(lock_path: &Path, ttl: Duration) -> Result<bool> {
                 }
             }
             Err(err) => {
-                return Err(err)
-                    .with_context(|| format!("failed to create lock file {}", lock_path.display()));
+                return Err(err).with_context(|| {
+                    format!("failed to create lock file {}", lock_path.display())
+                });
             }
         }
     }
@@ -1097,7 +1127,8 @@ fn read_lock_state(lock_path: &Path) -> Result<Option<UseBestLockState>> {
         Ok(raw) => raw,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(err) => {
-            return Err(err).with_context(|| format!("failed to read lock file {}", lock_path.display()));
+            return Err(err)
+                .with_context(|| format!("failed to read lock file {}", lock_path.display()));
         }
     };
 
@@ -1128,6 +1159,12 @@ fn switch_to(ctx: &AppContext, selected: &AccountProbeResult) -> Result<()> {
             selected.auth_path.display()
         )
     })?;
+    Ok(())
+}
+
+fn remove_selected(selected: &AccountProbeResult) -> Result<()> {
+    fs::remove_file(&selected.auth_path)
+        .with_context(|| format!("failed to remove {}", selected.auth_path.display()))?;
     Ok(())
 }
 
@@ -1199,7 +1236,11 @@ fn restore_auth_backup(backup_path: &Path, auth_path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn store_account_auth(ctx: &AppContext, probe: &AccountProbeResult, bytes: &[u8]) -> Result<PathBuf> {
+fn store_account_auth(
+    ctx: &AppContext,
+    probe: &AccountProbeResult,
+    bytes: &[u8],
+) -> Result<PathBuf> {
     let existing = discover_auth_files(ctx)?;
     if let Some(found) = existing
         .iter()
@@ -1258,32 +1299,6 @@ fn auth_stem(file_name: &str) -> &str {
     file_name.strip_suffix(".json").unwrap_or(file_name)
 }
 
-fn find_codex_path() -> Option<PathBuf> {
-    let output = Command::new("which").arg("codex").output().ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    if text.is_empty() {
-        None
-    } else {
-        Some(PathBuf::from(text))
-    }
-}
-
-fn codex_version() -> Option<String> {
-    let output = Command::new("codex").arg("--version").output().ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    if text.is_empty() {
-        None
-    } else {
-        Some(text)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1307,7 +1322,11 @@ mod tests {
         }
     }
 
-    fn sample_result(auth_file: &str, primary_left: f64, secondary_left: f64) -> AccountProbeResult {
+    fn sample_result(
+        auth_file: &str,
+        primary_left: f64,
+        secondary_left: f64,
+    ) -> AccountProbeResult {
         AccountProbeResult {
             auth_file: auth_file.to_string(),
             auth_path: PathBuf::from(format!("/tmp/{auth_file}")),

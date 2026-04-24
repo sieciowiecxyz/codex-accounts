@@ -61,7 +61,6 @@ Example stored names:
 ## Quick Commands
 
 ```bash
-codex-accounts doctor
 codex-accounts list
 codex-accounts list --refresh
 codex-accounts list --json
@@ -69,6 +68,7 @@ codex-accounts use alpha.user_at_example.com
 codex-accounts use-best --dry-run
 codex-accounts use-best
 codex-accounts import-new
+codex-accounts remove alpha.user_at_example.com
 ```
 
 ## Install
