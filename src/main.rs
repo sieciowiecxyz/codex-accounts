@@ -1,5 +1,4 @@
 use std::cmp::Ordering;
-use std::collections::BTreeMap;
 use std::fs;
 use std::io::{IsTerminal, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
@@ -21,14 +20,11 @@ const CACHE_TTL_SECS: i64 = 45;
 const PROBE_TIMEOUT_SECS: u64 = 8;
 const MAX_CONCURRENCY: usize = 4;
 const USE_BEST_LOCK_TTL_SECS: u64 = 300;
-const PREFERRED_WEEKLY_LEFT_PERCENT: f64 = 25.0;
-const BORDERLINE_WEEKLY_LEFT_PERCENT: f64 = 10.0;
 const ANSI_RESET: &str = "\x1b[0m";
 const ANSI_GREEN: &str = "\x1b[32m";
 const ANSI_YELLOW: &str = "\x1b[33m";
 const ANSI_RED: &str = "\x1b[31m";
 const ANSI_BOLD_GREEN: &str = "\x1b[1;32m";
-const ANSI_BOLD_YELLOW: &str = "\x1b[1;33m";
 const ANSI_BOLD_CYAN: &str = "\x1b[1;36m";
 
 #[derive(Parser, Debug)]
@@ -65,8 +61,6 @@ struct SelectorArgs {
 struct UseBestArgs {
     #[arg(long)]
     dry_run: bool,
-    #[arg(long, default_value_t = 0.0)]
-    min_primary_left: f64,
 }
 
 #[derive(Debug, Clone)]
@@ -98,25 +92,14 @@ struct AccountProbeResult {
     account_label: String,
     email: Option<String>,
     plan_type: Option<String>,
-    primary: Option<WindowSummary>,
-    secondary: Option<WindowSummary>,
-    credits: Option<CreditsSummary>,
+    weekly: Option<WindowSummary>,
     status: ProbeStatus,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct WindowSummary {
-    used_percent: f64,
     left_percent: f64,
-    window_duration_mins: Option<u64>,
     resets_at: Option<i64>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct CreditsSummary {
-    has_credits: bool,
-    unlimited: bool,
-    balance: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -164,43 +147,20 @@ enum AccountInfo {
 struct RateLimitReadResult {
     #[serde(rename = "rateLimits")]
     rate_limits: RateLimitSnapshot,
-    #[allow(dead_code)]
-    #[serde(rename = "rateLimitsByLimitId")]
-    rate_limits_by_limit_id: Option<BTreeMap<String, RateLimitSnapshot>>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 struct RateLimitSnapshot {
-    #[allow(dead_code)]
-    #[serde(rename = "limitId")]
-    limit_id: Option<String>,
-    #[allow(dead_code)]
-    #[serde(rename = "limitName")]
-    limit_name: Option<String>,
     primary: Option<RateLimitWindow>,
     secondary: Option<RateLimitWindow>,
-    credits: Option<CreditsSnapshot>,
-    #[allow(dead_code)]
-    #[serde(rename = "planType")]
-    plan_type: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 struct RateLimitWindow {
     #[serde(rename = "usedPercent")]
     used_percent: f64,
-    #[serde(rename = "windowDurationMins")]
-    window_duration_mins: Option<u64>,
     #[serde(rename = "resetsAt")]
     resets_at: Option<i64>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-struct CreditsSnapshot {
-    #[serde(rename = "hasCredits")]
-    has_credits: bool,
-    unlimited: bool,
-    balance: Option<String>,
 }
 
 struct ChildGuard {
@@ -280,8 +240,7 @@ fn main() -> Result<()> {
         Commands::UseBest(args) => {
             let results = probe_accounts(&ctx)?;
             save_cache(&ctx, &results)?;
-            let selected =
-                select_best_candidate(&ctx, &results, args.min_primary_left, !args.dry_run)?;
+            let selected = select_best_candidate(&ctx, &results, !args.dry_run)?;
             if args.dry_run {
                 print_use_best_preview(selected);
             } else {
@@ -312,7 +271,7 @@ fn app_context() -> Result<AppContext> {
     };
     let accounts_root = codex_root.join("accounts");
     let tmp_root = codex_root.join("tmp").join("codex-accounts");
-    let cache_path = tmp_root.join("cache.json");
+    let cache_path = tmp_root.join("cache-v2.json");
     fs::create_dir_all(&accounts_root)
         .with_context(|| format!("failed to create {}", accounts_root.display()))?;
     fs::create_dir_all(&tmp_root)
@@ -466,7 +425,7 @@ fn probe_accounts(ctx: &AppContext) -> Result<Vec<AccountProbeResult>> {
         bail!("no auth*.json files found in {}", ctx.codex_root.display());
     }
 
-    let concurrency = auth_files.len().min(MAX_CONCURRENCY).max(1);
+    let concurrency = auth_files.len().clamp(1, MAX_CONCURRENCY);
     let pool = rayon::ThreadPoolBuilder::new()
         .num_threads(concurrency)
         .build()
@@ -493,9 +452,7 @@ fn probe_single_auth(ctx: &AppContext, auth_file: &AuthFile) -> AccountProbeResu
             account_label: "<unavailable>".to_string(),
             email: None,
             plan_type: None,
-            primary: None,
-            secondary: None,
-            credits: None,
+            weekly: None,
             status: ProbeStatus::Error(err.to_string()),
         },
     }
@@ -538,13 +495,36 @@ fn probe_single_auth_inner(ctx: &AppContext, auth_file: &AuthFile) -> Result<Acc
         }),
     )?;
     let account: AccountReadResult = rpc_request(&mut websocket, 2, "account/read", json!({}))?;
-    let rate_limits: RateLimitReadResult =
-        rpc_request(&mut websocket, 3, "account/rateLimits/read", Value::Null)?;
-
     let (account_label, email, plan_type) = match account.account {
         Some(AccountInfo::ApiKey) => ("apiKey".to_string(), None, None),
         Some(AccountInfo::Chatgpt { email, plan_type }) => (email.clone(), Some(email), plan_type),
         None => ("<unknown>".to_string(), None, None),
+    };
+
+    let weekly = match rpc_request::<_, RateLimitReadResult>(
+        &mut websocket,
+        3,
+        "account/rateLimits/read",
+        Value::Null,
+    ) {
+        Ok(rate_limits) => rate_limits
+            .rate_limits
+            .primary
+            .or(rate_limits.rate_limits.secondary)
+            .map(window_summary),
+        Err(err) => {
+            let _ = websocket.close(None);
+            return Ok(AccountProbeResult {
+                auth_file: auth_file_name(&auth_file.path),
+                auth_path: auth_file.path.clone(),
+                is_current: auth_file.is_current,
+                account_label,
+                email,
+                plan_type,
+                weekly: None,
+                status: ProbeStatus::Error(err.to_string()),
+            });
+        }
     };
 
     let _ = websocket.close(None);
@@ -556,16 +536,7 @@ fn probe_single_auth_inner(ctx: &AppContext, auth_file: &AuthFile) -> Result<Acc
         account_label,
         email,
         plan_type,
-        primary: rate_limits.rate_limits.primary.map(window_summary),
-        secondary: rate_limits.rate_limits.secondary.map(window_summary),
-        credits: rate_limits
-            .rate_limits
-            .credits
-            .map(|credits| CreditsSummary {
-                has_credits: credits.has_credits,
-                unlimited: credits.unlimited,
-                balance: credits.balance,
-            }),
+        weekly,
         status: ProbeStatus::Ok,
     })
 }
@@ -662,20 +633,15 @@ where
 }
 
 fn window_summary(window: RateLimitWindow) -> WindowSummary {
-    let left_percent = (100.0 - window.used_percent).max(0.0);
     WindowSummary {
-        used_percent: window.used_percent,
-        left_percent,
-        window_duration_mins: window.window_duration_mins,
+        left_percent: (100.0 - window.used_percent).max(0.0),
         resets_at: window.resets_at,
     }
 }
 
 fn compare_results(left: &AccountProbeResult, right: &AccountProbeResult) -> Ordering {
     compare_status(left, right)
-        .then_with(|| compare_preference_bucket(right, left))
-        .then_with(|| compare_window(left.primary.as_ref(), right.primary.as_ref()))
-        .then_with(|| compare_window(left.secondary.as_ref(), right.secondary.as_ref()))
+        .then_with(|| compare_window(left.weekly.as_ref(), right.weekly.as_ref()))
         .then_with(|| left.auth_file.cmp(&right.auth_file))
 }
 
@@ -700,11 +666,8 @@ fn print_table(results: &[AccountProbeResult]) {
         "auth",
         "account",
         "plan",
-        "5h left",
-        "5h reset",
         "weekly left",
         "weekly reset",
-        "credits",
         "status",
     ];
     let color_enabled = stdout_is_tty();
@@ -719,11 +682,8 @@ fn print_table(results: &[AccountProbeResult]) {
             },
             result.account_label.clone(),
             result.plan_type.clone().unwrap_or_else(|| "-".to_string()),
-            format_left(result.primary.as_ref()),
-            format_reset(result.primary.as_ref()),
-            format_left(result.secondary.as_ref()),
-            format_reset(result.secondary.as_ref()),
-            format_credits(result.credits.as_ref()),
+            format_left(result.weekly.as_ref()),
+            format_reset(result.weekly.as_ref()),
             format_status(&result.status),
         ]);
     }
@@ -736,21 +696,18 @@ fn print_table(results: &[AccountProbeResult]) {
     }
 
     println!(
-        "{}  {}  {}  {}  {}  {}  {}  {}  {}",
+        "{}  {}  {}  {}  {}  {}",
         render_header(headers[0], widths[0], false, color_enabled),
         render_header(headers[1], widths[1], false, color_enabled),
         render_header(headers[2], widths[2], false, color_enabled),
         render_header(headers[3], widths[3], true, color_enabled),
         render_header(headers[4], widths[4], false, color_enabled),
-        render_header(headers[5], widths[5], true, color_enabled),
-        render_header(headers[6], widths[6], false, color_enabled),
-        render_header(headers[7], widths[7], false, color_enabled),
-        render_header(headers[8], widths[8], false, color_enabled),
+        render_header(headers[5], widths[5], false, color_enabled),
     );
 
     for (result, row) in results.iter().zip(rows) {
         println!(
-            "{}  {}  {}  {}  {}  {}  {}  {}  {}",
+            "{}  {}  {}  {}  {}  {}",
             render_auth_cell(&row[0], widths[0], result.is_current, color_enabled),
             render_plain_cell(&row[1], widths[1], false, color_enabled, None),
             render_plain_cell(&row[2], widths[2], false, color_enabled, None),
@@ -759,21 +716,12 @@ fn print_table(results: &[AccountProbeResult]) {
                 widths[3],
                 true,
                 color_enabled,
-                Some(color_for_percent(primary_left_percent(result))),
+                Some(color_for_percent(weekly_left_percent(result))),
             ),
             render_plain_cell(&row[4], widths[4], false, color_enabled, None),
             render_plain_cell(
                 &row[5],
                 widths[5],
-                true,
-                color_enabled,
-                Some(color_for_percent(secondary_left_percent(result))),
-            ),
-            render_plain_cell(&row[6], widths[6], false, color_enabled, None),
-            render_plain_cell(&row[7], widths[7], false, color_enabled, None),
-            render_plain_cell(
-                &row[8],
-                widths[8],
                 false,
                 color_enabled,
                 Some(status_color(&result.status))
@@ -784,23 +732,13 @@ fn print_table(results: &[AccountProbeResult]) {
 
 fn print_use_best_preview(selected: &AccountProbeResult) {
     let color_enabled = stdout_is_tty();
-    let highlight = if is_preferred_candidate(selected) {
-        ANSI_BOLD_GREEN
-    } else {
-        ANSI_BOLD_YELLOW
-    };
     println!(
-        "{} -> {} | 5h left {} | weekly left {}",
-        paint(&selected.auth_file, highlight, color_enabled),
-        paint(&selected.account_label, highlight, color_enabled),
+        "{} -> {} | weekly left {}",
+        paint(&selected.auth_file, ANSI_BOLD_GREEN, color_enabled),
+        paint(&selected.account_label, ANSI_BOLD_GREEN, color_enabled),
         paint(
-            &format_left(selected.primary.as_ref()),
-            color_for_percent(primary_left_percent(selected)),
-            color_enabled,
-        ),
-        paint(
-            &format_left(selected.secondary.as_ref()),
-            color_for_percent(secondary_left_percent(selected)),
+            &format_left(selected.weekly.as_ref()),
+            color_for_percent(weekly_left_percent(selected)),
             color_enabled,
         ),
     );
@@ -871,17 +809,6 @@ fn format_reset(window: Option<&WindowSummary>) -> String {
     }
 }
 
-fn format_credits(credits: Option<&CreditsSummary>) -> String {
-    match credits {
-        Some(credits) if credits.unlimited => "unlimited".to_string(),
-        Some(credits) if credits.has_credits => {
-            credits.balance.clone().unwrap_or_else(|| "yes".to_string())
-        }
-        Some(_) => "-".to_string(),
-        None => "-".to_string(),
-    }
-}
-
 fn format_status(status: &ProbeStatus) -> String {
     match status {
         ProbeStatus::Ok => "ok".to_string(),
@@ -897,45 +824,21 @@ fn status_color(status: &ProbeStatus) -> &'static str {
 }
 
 fn color_for_percent(left_percent: f64) -> &'static str {
-    if left_percent >= PREFERRED_WEEKLY_LEFT_PERCENT {
+    if left_percent >= 50.0 {
         ANSI_GREEN
-    } else if left_percent >= BORDERLINE_WEEKLY_LEFT_PERCENT {
+    } else if left_percent >= 20.0 {
         ANSI_YELLOW
     } else {
         ANSI_RED
     }
 }
 
-fn primary_left_percent(result: &AccountProbeResult) -> f64 {
+fn weekly_left_percent(result: &AccountProbeResult) -> f64 {
     result
-        .primary
+        .weekly
         .as_ref()
         .map(|item| item.left_percent)
         .unwrap_or(0.0)
-}
-
-fn secondary_left_percent(result: &AccountProbeResult) -> f64 {
-    result
-        .secondary
-        .as_ref()
-        .map(|item| item.left_percent)
-        .unwrap_or(0.0)
-}
-
-fn is_preferred_candidate(result: &AccountProbeResult) -> bool {
-    secondary_left_percent(result) >= PREFERRED_WEEKLY_LEFT_PERCENT
-}
-
-fn compare_preference_bucket(left: &AccountProbeResult, right: &AccountProbeResult) -> Ordering {
-    preference_bucket(left).cmp(&preference_bucket(right))
-}
-
-fn preference_bucket(result: &AccountProbeResult) -> u8 {
-    if is_preferred_candidate(result) {
-        1
-    } else {
-        0
-    }
 }
 
 fn truncate(text: &str, max_len: usize) -> String {
@@ -996,12 +899,11 @@ fn resolve_selector<'a>(
 fn select_best_candidate<'a>(
     ctx: &AppContext,
     results: &'a [AccountProbeResult],
-    min_primary_left: f64,
     claim: bool,
 ) -> Result<&'a AccountProbeResult> {
-    let candidates = rank_best_candidates(results, min_primary_left);
+    let candidates = rank_best_candidates(results);
     if candidates.is_empty() {
-        bail!("no account satisfied the requested minimum primary limit");
+        bail!("no account has a readable weekly limit");
     }
 
     let fallback = candidates.first().copied().unwrap();
@@ -1022,28 +924,16 @@ fn select_best_candidate<'a>(
 }
 
 fn compare_best_candidate(left: &AccountProbeResult, right: &AccountProbeResult) -> Ordering {
-    compare_preference_bucket(left, right)
-        .then_with(|| {
-            primary_left_percent(left)
-                .partial_cmp(&primary_left_percent(right))
-                .unwrap_or(Ordering::Equal)
-        })
-        .then_with(|| {
-            secondary_left_percent(left)
-                .partial_cmp(&secondary_left_percent(right))
-                .unwrap_or(Ordering::Equal)
-        })
+    weekly_left_percent(left)
+        .partial_cmp(&weekly_left_percent(right))
+        .unwrap_or(Ordering::Equal)
         .then_with(|| right.auth_file.cmp(&left.auth_file))
 }
 
-fn rank_best_candidates<'a>(
-    results: &'a [AccountProbeResult],
-    min_primary_left: f64,
-) -> Vec<&'a AccountProbeResult> {
+fn rank_best_candidates(results: &[AccountProbeResult]) -> Vec<&AccountProbeResult> {
     let mut candidates: Vec<&AccountProbeResult> = results
         .iter()
         .filter(|result| matches!(result.status, ProbeStatus::Ok))
-        .filter(|result| primary_left_percent(result) >= min_primary_left)
         .collect();
     candidates.sort_by(|left, right| compare_best_candidate(right, left));
     candidates
@@ -1169,71 +1059,39 @@ fn remove_selected(selected: &AccountProbeResult) -> Result<()> {
 }
 
 fn import_new_account(ctx: &AppContext) -> Result<PathBuf> {
-    let auth_path = ctx.codex_root.join("auth.json");
-    let backup_path = ctx.tmp_root.join("auth.import-backup.json");
-
-    if backup_path.exists() {
-        fs::remove_file(&backup_path)
-            .with_context(|| format!("failed to remove stale backup {}", backup_path.display()))?;
-    }
-
-    if auth_path.exists() {
-        fs::copy(&auth_path, &backup_path).with_context(|| {
-            format!(
-                "failed to back up {} into {}",
-                auth_path.display(),
-                backup_path.display()
-            )
-        })?;
-        fs::remove_file(&auth_path)
-            .with_context(|| format!("failed to remove {}", auth_path.display()))?;
-    }
-
+    let login_home = Builder::new()
+        .prefix("import-")
+        .tempdir_in(&ctx.tmp_root)
+        .with_context(|| format!("failed to create temp dir in {}", ctx.tmp_root.display()))?;
     let status = Command::new("codex")
-        .current_dir(&ctx.codex_root)
+        .arg("login")
+        .env("CODEX_HOME", login_home.path())
+        .current_dir(login_home.path())
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
         .status()
         .context("failed to launch interactive codex login")?;
-
-    if !auth_path.exists() {
-        restore_auth_backup(&backup_path, &auth_path)?;
-        bail!(
-            "Codex exited with status {} and did not leave a new auth.json",
-            status
-        );
+    if !status.success() {
+        bail!("Codex login exited with status {status}");
     }
 
-    let bytes =
-        fs::read(&auth_path).with_context(|| format!("failed to read {}", auth_path.display()))?;
+    let auth_path = login_home.path().join("auth.json");
+    let bytes = fs::read(&auth_path).with_context(|| {
+        format!(
+            "Codex login did not leave auth.json in {}",
+            login_home.path().display()
+        )
+    })?;
     let imported = AuthFile {
         path: auth_path.clone(),
         bytes: bytes.clone(),
-        is_current: true,
+        is_current: false,
     };
     let probe = probe_single_auth_inner(ctx, &imported)?;
     let stored_path = store_account_auth(ctx, &probe, &bytes)?;
-
-    if backup_path.exists() {
-        fs::remove_file(&backup_path)
-            .with_context(|| format!("failed to remove {}", backup_path.display()))?;
-    }
-
+    switch_to(ctx, &probe)?;
     Ok(stored_path)
-}
-
-fn restore_auth_backup(backup_path: &Path, auth_path: &Path) -> Result<()> {
-    if backup_path.exists() {
-        fs::rename(backup_path, auth_path).with_context(|| {
-            format!(
-                "failed to restore {} back to {}",
-                backup_path.display(),
-                auth_path.display()
-            )
-        })?;
-    }
-    Ok(())
 }
 
 fn store_account_auth(
@@ -1315,18 +1173,12 @@ mod tests {
 
     fn sample_window(left_percent: f64) -> WindowSummary {
         WindowSummary {
-            used_percent: (100.0 - left_percent).max(0.0),
             left_percent,
-            window_duration_mins: Some(300),
             resets_at: None,
         }
     }
 
-    fn sample_result(
-        auth_file: &str,
-        primary_left: f64,
-        secondary_left: f64,
-    ) -> AccountProbeResult {
+    fn sample_result(auth_file: &str, weekly_left: f64) -> AccountProbeResult {
         AccountProbeResult {
             auth_file: auth_file.to_string(),
             auth_path: PathBuf::from(format!("/tmp/{auth_file}")),
@@ -1334,9 +1186,7 @@ mod tests {
             account_label: auth_file.to_string(),
             email: Some(format!("{auth_file}@example.com")),
             plan_type: Some("plus".to_string()),
-            primary: Some(sample_window(primary_left)),
-            secondary: Some(sample_window(secondary_left)),
-            credits: None,
+            weekly: Some(sample_window(weekly_left)),
             status: ProbeStatus::Ok,
         }
     }
@@ -1354,85 +1204,40 @@ mod tests {
     }
 
     #[test]
-    fn select_best_prefers_weekly_above_floor() {
+    fn select_best_uses_highest_weekly_limit() {
         let tempdir = tempfile::tempdir().unwrap();
         let ctx = sample_ctx(&tempdir);
         let results = vec![
-            sample_result("fallback.json", 100.0, 20.0),
-            sample_result("preferred.json", 80.0, 60.0),
+            sample_result("lower.json", 20.0),
+            sample_result("higher.json", 60.0),
         ];
 
-        let selected = select_best_candidate(&ctx, &results, 0.0, false).unwrap();
-        assert_eq!(selected.auth_file, "preferred.json");
+        let selected = select_best_candidate(&ctx, &results, false).unwrap();
+        assert_eq!(selected.auth_file, "higher.json");
     }
 
     #[test]
-    fn select_best_falls_back_when_everything_is_below_weekly_floor() {
-        let tempdir = tempfile::tempdir().unwrap();
-        let ctx = sample_ctx(&tempdir);
-        let results = vec![
-            sample_result("best-primary.json", 100.0, 20.0),
-            sample_result("worse-primary.json", 95.0, 5.0),
-        ];
-
-        let selected = select_best_candidate(&ctx, &results, 0.0, false).unwrap();
-        assert_eq!(selected.auth_file, "best-primary.json");
-    }
-
-    #[test]
-    fn select_best_respects_primary_floor() {
-        let tempdir = tempfile::tempdir().unwrap();
-        let ctx = sample_ctx(&tempdir);
-        let results = vec![
-            sample_result("a.json", 80.0, 60.0),
-            sample_result("b.json", 90.0, 60.0),
-        ];
-
-        let err = select_best_candidate(&ctx, &results, 95.0, false).unwrap_err();
-        assert!(err.to_string().contains("requested minimum primary limit"));
-    }
-
-    #[test]
-    fn compare_results_sorts_preferred_accounts_first() {
-        let mut results = vec![
-            sample_result("fallback.json", 100.0, 5.0),
-            sample_result("preferred.json", 90.0, 50.0),
+    fn compare_results_sorts_highest_weekly_limit_first() {
+        let mut results = [
+            sample_result("lower.json", 20.0),
+            sample_result("higher.json", 60.0),
         ];
 
         results.sort_by(compare_results);
-        assert_eq!(results[0].auth_file, "preferred.json");
+        assert_eq!(results[0].auth_file, "higher.json");
     }
 
     #[test]
-    fn claiming_best_account_locks_it_for_the_next_run() {
+    fn select_best_skips_cooled_down_account() {
         let tempdir = tempfile::tempdir().unwrap();
         let ctx = sample_ctx(&tempdir);
         let results = vec![
-            sample_result("best.json", 100.0, 60.0),
-            sample_result("backup.json", 90.0, 55.0),
+            sample_result("best.json", 60.0),
+            sample_result("backup.json", 50.0),
         ];
+        lock_account(&results[0], chrono::Utc::now().timestamp() + 300, &tempdir);
 
-        let first = select_best_candidate(&ctx, &results, 0.0, true).unwrap();
-        assert_eq!(first.auth_file, "best.json");
-
-        let second = select_best_candidate(&ctx, &results, 0.0, true).unwrap();
-        assert_eq!(second.auth_file, "backup.json");
-    }
-
-    #[test]
-    fn select_best_falls_back_to_locked_account_when_everything_is_locked() {
-        let tempdir = tempfile::tempdir().unwrap();
-        let now = chrono::Utc::now().timestamp();
-        let ctx = sample_ctx(&tempdir);
-        let results = vec![
-            sample_result("best.json", 100.0, 60.0),
-            sample_result("backup.json", 90.0, 55.0),
-        ];
-
-        lock_account(&results[0], now + 300, &tempdir);
-        lock_account(&results[1], now + 300, &tempdir);
-
-        let selected = select_best_candidate(&ctx, &results, 0.0, false).unwrap();
-        assert_eq!(selected.auth_file, "best.json");
+        let selected = select_best_candidate(&ctx, &results, false).unwrap();
+        assert_eq!(selected.auth_file, "backup.json");
     }
 }

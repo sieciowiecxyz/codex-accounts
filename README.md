@@ -2,7 +2,7 @@
 
 `codex-accounts` is a tiny CLI for people who keep multiple Codex / ChatGPT logins and want two things:
 
-- see which account still has room in the `5h` and `weekly` limits
+- see which account still has room in the weekly limit
 - switch `~/.codex/auth.json` quickly
 
 It reads stored account auth files, shows live usage, and can import a freshly logged-in account into `~/.codex/accounts/`.
@@ -11,16 +11,15 @@ It reads stored account auth files, shows live usage, and can import a freshly l
 
 ```bash
 $ codex-accounts list --refresh
-auth                                 account                   plan  5h left  5h reset      weekly left  weekly reset  credits  status
-alpha.user_at_example.com.json       alpha.user@example.com    team     100%  22 Mar 06:56          70%  28 Mar 14:07  -        ok
-beta.user_at_example.com.json        beta.user@example.com     plus      98%  22 Mar 02:36           4%  25 Mar 17:45  -        ok
-gamma.user_at_example.com.json *     gamma.user@example.com    team      43%  22 Mar 02:14          83%  28 Mar 21:14  -        ok
-delta.user_at_example.com.json       delta.user@example.com    team       0%  22 Mar 02:12          70%  28 Mar 21:12  -        ok
+auth                                 account                   plan  weekly left  weekly reset  status
+alpha.user_at_example.com.json       alpha.user@example.com    team           70%  28 Mar 14:07  ok
+beta.user_at_example.com.json        beta.user@example.com     plus            4%  25 Mar 17:45  ok
+gamma.user_at_example.com.json *     gamma.user@example.com    team           83%  28 Mar 21:14  ok
 ```
 
 `*` means: this account matches the currently active `~/.codex/auth.json`.
 
-`use-best` prefers accounts with at least `25%` weekly left. If nothing clears that bar, it falls back to the best remaining account. After a successful run, the chosen account is cooled down for 5 minutes so another terminal will pick something else first. If every candidate is already cooled down, it can fall back to the same account.
+`use-best` picks the account with the most weekly limit remaining. After a successful run, the chosen account is cooled down for 5 minutes so another terminal will pick something else first. If every candidate is already cooled down, it can fall back to the same account.
 
 When you run the CLI in a real terminal, the human-readable output is colorized. `--json` stays plain.
 
@@ -29,7 +28,7 @@ When you run the CLI in a real terminal, the human-readable output is colorized.
 ```bash
 $ codex-accounts list --refresh
 $ codex-accounts use-best --dry-run
-alpha.user_at_example.com.json -> alpha.user@example.com | 5h left 100% | weekly left 70%
+alpha.user_at_example.com.json -> alpha.user@example.com | weekly left 70%
 
 $ codex-accounts use-best
 Switched to best account: alpha.user_at_example.com.json (alpha.user@example.com)
@@ -43,11 +42,10 @@ $ codex-accounts import-new
 
 What happens:
 
-1. current `~/.codex/auth.json` is backed up
-2. interactive `codex` is launched
-3. you log into a new account and exit
-4. the new auth is stored as `~/.codex/accounts/<email>.json`
-5. the new auth also remains active as `~/.codex/auth.json`
+1. `codex login` runs in an isolated temporary `CODEX_HOME`
+2. you log into a new account
+3. the new auth is stored as `~/.codex/accounts/<email>.json`
+4. the new auth becomes active only after it was stored successfully
 
 Example stored names:
 
@@ -93,7 +91,6 @@ If you already installed `codex-accounts` before, rerun the same command with `-
 
 ```bash
 cargo install --path . --force --locked
-codex-accounts doctor
 codex-accounts list --refresh
 codex-accounts use-best --dry-run
 ```
