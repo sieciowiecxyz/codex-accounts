@@ -93,6 +93,7 @@ struct AccountProbeResult {
     email: Option<String>,
     plan_type: Option<String>,
     weekly: Option<WindowSummary>,
+    reset_credits: Option<u64>,
     status: ProbeStatus,
 }
 
@@ -147,6 +148,14 @@ enum AccountInfo {
 struct RateLimitReadResult {
     #[serde(rename = "rateLimits")]
     rate_limits: RateLimitSnapshot,
+    #[serde(rename = "rateLimitResetCredits")]
+    reset_credits: Option<RateLimitResetCredits>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct RateLimitResetCredits {
+    #[serde(rename = "availableCount")]
+    available_count: u64,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -271,7 +280,7 @@ fn app_context() -> Result<AppContext> {
     };
     let accounts_root = codex_root.join("accounts");
     let tmp_root = codex_root.join("tmp").join("codex-accounts");
-    let cache_path = tmp_root.join("cache-v2.json");
+    let cache_path = tmp_root.join("cache-v3.json");
     fs::create_dir_all(&accounts_root)
         .with_context(|| format!("failed to create {}", accounts_root.display()))?;
     fs::create_dir_all(&tmp_root)
@@ -453,6 +462,7 @@ fn probe_single_auth(ctx: &AppContext, auth_file: &AuthFile) -> AccountProbeResu
             email: None,
             plan_type: None,
             weekly: None,
+            reset_credits: None,
             status: ProbeStatus::Error(err.to_string()),
         },
     }
@@ -501,17 +511,22 @@ fn probe_single_auth_inner(ctx: &AppContext, auth_file: &AuthFile) -> Result<Acc
         None => ("<unknown>".to_string(), None, None),
     };
 
-    let weekly = match rpc_request::<_, RateLimitReadResult>(
+    let (weekly, reset_credits) = match rpc_request::<_, RateLimitReadResult>(
         &mut websocket,
         3,
         "account/rateLimits/read",
         Value::Null,
     ) {
-        Ok(rate_limits) => rate_limits
-            .rate_limits
-            .primary
-            .or(rate_limits.rate_limits.secondary)
-            .map(window_summary),
+        Ok(rate_limits) => (
+            rate_limits
+                .rate_limits
+                .primary
+                .or(rate_limits.rate_limits.secondary)
+                .map(window_summary),
+            rate_limits
+                .reset_credits
+                .map(|credits| credits.available_count),
+        ),
         Err(err) => {
             let _ = websocket.close(None);
             return Ok(AccountProbeResult {
@@ -522,6 +537,7 @@ fn probe_single_auth_inner(ctx: &AppContext, auth_file: &AuthFile) -> Result<Acc
                 email,
                 plan_type,
                 weekly: None,
+                reset_credits: None,
                 status: ProbeStatus::Error(err.to_string()),
             });
         }
@@ -537,6 +553,7 @@ fn probe_single_auth_inner(ctx: &AppContext, auth_file: &AuthFile) -> Result<Acc
         email,
         plan_type,
         weekly,
+        reset_credits,
         status: ProbeStatus::Ok,
     })
 }
@@ -668,6 +685,7 @@ fn print_table(results: &[AccountProbeResult]) {
         "plan",
         "weekly left",
         "weekly reset",
+        "resets",
         "status",
     ];
     let color_enabled = stdout_is_tty();
@@ -684,6 +702,7 @@ fn print_table(results: &[AccountProbeResult]) {
             result.plan_type.clone().unwrap_or_else(|| "-".to_string()),
             format_left(result.weekly.as_ref()),
             format_reset(result.weekly.as_ref()),
+            format_reset_credits(result.reset_credits),
             format_status(&result.status),
         ]);
     }
@@ -696,18 +715,19 @@ fn print_table(results: &[AccountProbeResult]) {
     }
 
     println!(
-        "{}  {}  {}  {}  {}  {}",
+        "{}  {}  {}  {}  {}  {}  {}",
         render_header(headers[0], widths[0], false, color_enabled),
         render_header(headers[1], widths[1], false, color_enabled),
         render_header(headers[2], widths[2], false, color_enabled),
         render_header(headers[3], widths[3], true, color_enabled),
         render_header(headers[4], widths[4], false, color_enabled),
-        render_header(headers[5], widths[5], false, color_enabled),
+        render_header(headers[5], widths[5], true, color_enabled),
+        render_header(headers[6], widths[6], false, color_enabled),
     );
 
     for (result, row) in results.iter().zip(rows) {
         println!(
-            "{}  {}  {}  {}  {}  {}",
+            "{}  {}  {}  {}  {}  {}  {}",
             render_auth_cell(&row[0], widths[0], result.is_current, color_enabled),
             render_plain_cell(&row[1], widths[1], false, color_enabled, None),
             render_plain_cell(&row[2], widths[2], false, color_enabled, None),
@@ -722,6 +742,13 @@ fn print_table(results: &[AccountProbeResult]) {
             render_plain_cell(
                 &row[5],
                 widths[5],
+                true,
+                color_enabled,
+                Some(color_for_reset_credits(result.reset_credits)),
+            ),
+            render_plain_cell(
+                &row[6],
+                widths[6],
                 false,
                 color_enabled,
                 Some(status_color(&result.status))
@@ -809,6 +836,12 @@ fn format_reset(window: Option<&WindowSummary>) -> String {
     }
 }
 
+fn format_reset_credits(reset_credits: Option<u64>) -> String {
+    reset_credits
+        .map(|count| count.to_string())
+        .unwrap_or_else(|| "-".to_string())
+}
+
 fn format_status(status: &ProbeStatus) -> String {
     match status {
         ProbeStatus::Ok => "ok".to_string(),
@@ -828,6 +861,14 @@ fn color_for_percent(left_percent: f64) -> &'static str {
         ANSI_GREEN
     } else if left_percent >= 20.0 {
         ANSI_YELLOW
+    } else {
+        ANSI_RED
+    }
+}
+
+fn color_for_reset_credits(reset_credits: Option<u64>) -> &'static str {
+    if reset_credits.unwrap_or(0) > 0 {
+        ANSI_GREEN
     } else {
         ANSI_RED
     }
@@ -1187,8 +1228,19 @@ mod tests {
             email: Some(format!("{auth_file}@example.com")),
             plan_type: Some("plus".to_string()),
             weekly: Some(sample_window(weekly_left)),
+            reset_credits: None,
             status: ProbeStatus::Ok,
         }
+    }
+
+    #[test]
+    fn reads_available_reset_credits() {
+        let response: RateLimitReadResult = serde_json::from_str(
+            r#"{"rateLimits":{},"rateLimitResetCredits":{"availableCount":2}}"#,
+        )
+        .unwrap();
+
+        assert_eq!(response.reset_credits.unwrap().available_count, 2);
     }
 
     fn lock_account(result: &AccountProbeResult, expires_at: i64, tempdir: &tempfile::TempDir) {

@@ -11,13 +11,15 @@ It reads stored account auth files, shows live usage, and can import a freshly l
 
 ```bash
 $ codex-accounts list --refresh
-auth                                 account                   plan  weekly left  weekly reset  status
-alpha.user_at_example.com.json       alpha.user@example.com    team           70%  28 Mar 14:07  ok
-beta.user_at_example.com.json        beta.user@example.com     plus            4%  25 Mar 17:45  ok
-gamma.user_at_example.com.json *     gamma.user@example.com    team           83%  28 Mar 21:14  ok
+auth                                 account                   plan  weekly left  weekly reset  resets  status
+alpha.user_at_example.com.json       alpha.user@example.com    team           70%  28 Mar 14:07       2  ok
+beta.user_at_example.com.json        beta.user@example.com     plus            4%  25 Mar 17:45       0  ok
+gamma.user_at_example.com.json *     gamma.user@example.com    team           83%  28 Mar 21:14       -  ok
 ```
 
 `*` means: this account matches the currently active `~/.codex/auth.json`.
+
+`resets` is the number of available rate-limit reset credits reported by Codex.
 
 `use-best` picks the account with the most weekly limit remaining. After a successful run, the chosen account is cooled down for 5 minutes so another terminal will pick something else first. If every candidate is already cooled down, it can fall back to the same account.
 
