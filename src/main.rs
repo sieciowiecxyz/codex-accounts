@@ -1140,6 +1140,14 @@ fn store_account_auth(
     probe: &AccountProbeResult,
     bytes: &[u8],
 ) -> Result<PathBuf> {
+    if let Some(email) = &probe.email {
+        let path = ctx
+            .accounts_root
+            .join(format!("{}.json", sanitize_account_name(email)));
+        fs::write(&path, bytes).with_context(|| format!("failed to write {}", path.display()))?;
+        return Ok(path);
+    }
+
     let existing = discover_auth_files(ctx)?;
     if let Some(found) = existing
         .iter()
@@ -1277,6 +1285,24 @@ mod tests {
 
         results.sort_by(compare_results);
         assert_eq!(results[0].auth_file, "higher.json");
+    }
+
+    #[test]
+    fn importing_same_email_replaces_its_auth_file() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let ctx = sample_ctx(&tempdir);
+        fs::create_dir_all(&ctx.accounts_root).unwrap();
+        let probe = sample_result("ignored.json", 50.0);
+
+        let first = store_account_auth(&ctx, &probe, b"old auth").unwrap();
+        let second = store_account_auth(&ctx, &probe, b"new auth").unwrap();
+
+        assert_eq!(first, second);
+        assert_eq!(fs::read(second).unwrap(), b"new auth");
+        assert!(!ctx
+            .accounts_root
+            .join("ignored.json_at_example.com-2.json")
+            .exists());
     }
 
     #[test]
