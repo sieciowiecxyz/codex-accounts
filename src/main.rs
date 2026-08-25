@@ -1,6 +1,6 @@
 use std::cmp::Ordering;
 use std::fs;
-use std::io::{IsTerminal, Write};
+use std::io::{BufRead, IsTerminal, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -10,6 +10,8 @@ use std::time::{Duration, Instant};
 use anyhow::{anyhow, bail, Context, Result};
 use chrono::{Local, TimeZone};
 use clap::{Args, Parser, Subcommand};
+use console::{pad_str, Alignment, Style, Term};
+use dialoguer::{theme::ColorfulTheme, Select};
 use rayon::prelude::*;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -41,6 +43,8 @@ struct Cli {
 enum Commands {
     List(ListArgs),
     Use(SelectorArgs),
+    /// Interactively select an account and switch after confirmation.
+    Switch(SwitchArgs),
     UseBest(UseBestArgs),
     ImportNew,
     Remove(SelectorArgs),
@@ -57,6 +61,13 @@ struct ListArgs {
 #[derive(Args, Debug)]
 struct SelectorArgs {
     selector: String,
+}
+
+#[derive(Args, Debug, Clone)]
+struct SwitchArgs {
+    /// Refresh usage before showing the account list.
+    #[arg(long)]
+    refresh: bool,
 }
 
 #[derive(Args, Debug)]
@@ -240,6 +251,9 @@ fn main() -> Result<()> {
                 "Switched to {} ({})",
                 selected.auth_file, selected.account_label
             );
+        }
+        Commands::Switch(args) => {
+            run_interactive_switch(&ctx, &args)?;
         }
         Commands::Remove(args) => {
             let results = load_or_probe(&ctx, false)?;
@@ -740,91 +754,327 @@ fn compare_window(left: Option<&WindowSummary>, right: Option<&WindowSummary>) -
         .unwrap_or(Ordering::Equal)
 }
 
-fn print_table(results: &[AccountProbeResult]) {
-    let headers = [
-        "auth",
-        "account",
-        "plan",
-        "weekly left",
-        "weekly reset",
-        "resets",
-        "status",
-    ];
-    let color_enabled = stdout_is_tty();
+const TABLE_HEADERS: [&str; 9] = [
+    "auth",
+    "account",
+    "plan",
+    "5h left",
+    "5h reset",
+    "weekly left",
+    "weekly reset",
+    "resets",
+    "status",
+];
 
-    let mut rows = Vec::with_capacity(results.len());
-    for result in results {
-        rows.push(vec![
-            if result.is_current {
-                format!("{} *", result.auth_file)
-            } else {
-                result.auth_file.clone()
-            },
-            result.account_label.clone(),
-            result.plan_type.clone().unwrap_or_else(|| "-".to_string()),
-            format_left(result.weekly.as_ref()),
-            format_reset(result.weekly.as_ref()),
-            format_reset_credits(result.reset_credits),
-            format_status(&result.status),
-        ]);
-    }
+struct AccountTable {
+    rows: Vec<Vec<String>>,
+    widths: [usize; TABLE_HEADERS.len()],
+}
 
-    let mut widths = headers.map(str::len);
-    for row in &rows {
-        for (idx, value) in row.iter().enumerate() {
-            widths[idx] = widths[idx].max(value.len());
+impl AccountTable {
+    fn new(results: &[AccountProbeResult]) -> Self {
+        let rows = results
+            .iter()
+            .map(|result| {
+                vec![
+                    if result.is_current {
+                        format!("{} *", result.auth_file)
+                    } else {
+                        result.auth_file.clone()
+                    },
+                    result.account_label.clone(),
+                    result.plan_type.clone().unwrap_or_else(|| "-".to_string()),
+                    format_left(result.five_hour.as_ref()),
+                    format_reset(result.five_hour.as_ref()),
+                    format_left(result.weekly.as_ref()),
+                    format_reset(result.weekly.as_ref()),
+                    format_reset_credits(result.reset_credits),
+                    format_status(&result.status),
+                ]
+            })
+            .collect::<Vec<_>>();
+
+        let mut widths = TABLE_HEADERS.map(str::len);
+        for row in &rows {
+            for (idx, value) in row.iter().enumerate() {
+                widths[idx] = widths[idx].max(value.len());
+            }
         }
+
+        Self { rows, widths }
     }
 
-    println!(
-        "{}  {}  {}  {}  {}  {}  {}",
-        render_header(headers[0], widths[0], false, color_enabled),
-        render_header(headers[1], widths[1], false, color_enabled),
-        render_header(headers[2], widths[2], false, color_enabled),
-        render_header(headers[3], widths[3], true, color_enabled),
-        render_header(headers[4], widths[4], false, color_enabled),
-        render_header(headers[5], widths[5], true, color_enabled),
-        render_header(headers[6], widths[6], false, color_enabled),
-    );
+    fn header(&self, color_enabled: bool) -> String {
+        format!(
+            "{}  {}  {}  {}  {}  {}  {}  {}  {}",
+            render_header(TABLE_HEADERS[0], self.widths[0], false, color_enabled),
+            render_header(TABLE_HEADERS[1], self.widths[1], false, color_enabled),
+            render_header(TABLE_HEADERS[2], self.widths[2], false, color_enabled),
+            render_header(TABLE_HEADERS[3], self.widths[3], true, color_enabled),
+            render_header(TABLE_HEADERS[4], self.widths[4], false, color_enabled),
+            render_header(TABLE_HEADERS[5], self.widths[5], true, color_enabled),
+            render_header(TABLE_HEADERS[6], self.widths[6], false, color_enabled),
+            render_header(TABLE_HEADERS[7], self.widths[7], true, color_enabled),
+            render_header(TABLE_HEADERS[8], self.widths[8], false, color_enabled),
+        )
+    }
 
-    for (result, row) in results.iter().zip(rows) {
-        println!(
-            "{}  {}  {}  {}  {}  {}  {}",
-            render_auth_cell(&row[0], widths[0], result.is_current, color_enabled),
-            render_plain_cell(&row[1], widths[1], false, color_enabled, None),
-            render_plain_cell(&row[2], widths[2], false, color_enabled, None),
+    fn row(&self, idx: usize, result: &AccountProbeResult, color_enabled: bool) -> String {
+        let row = &self.rows[idx];
+        format!(
+            "{}  {}  {}  {}  {}  {}  {}  {}  {}",
+            render_auth_cell(&row[0], self.widths[0], result.is_current, color_enabled),
+            render_plain_cell(&row[1], self.widths[1], false, color_enabled, None),
+            render_plain_cell(&row[2], self.widths[2], false, color_enabled, None),
             render_plain_cell(
                 &row[3],
-                widths[3],
+                self.widths[3],
+                true,
+                color_enabled,
+                Some(color_for_percent(five_hour_left_percent(result))),
+            ),
+            render_plain_cell(&row[4], self.widths[4], false, color_enabled, None),
+            render_plain_cell(
+                &row[5],
+                self.widths[5],
                 true,
                 color_enabled,
                 Some(color_for_percent(weekly_left_percent(result))),
             ),
-            render_plain_cell(&row[4], widths[4], false, color_enabled, None),
+            render_plain_cell(&row[6], self.widths[6], false, color_enabled, None),
             render_plain_cell(
-                &row[5],
-                widths[5],
+                &row[7],
+                self.widths[7],
                 true,
                 color_enabled,
                 Some(color_for_reset_credits(result.reset_credits)),
             ),
             render_plain_cell(
-                &row[6],
-                widths[6],
+                &row[8],
+                self.widths[8],
                 false,
                 color_enabled,
                 Some(status_color(&result.status))
             ),
+        )
+    }
+
+    fn interactive(&self, width: usize) -> Result<(String, Vec<String>)> {
+        let columns: &[usize] = if width >= 140 {
+            &[0, 1, 2, 3, 4, 5, 6, 7, 8]
+        } else if width >= 105 {
+            &[0, 1, 2, 3, 4, 5, 6, 8]
+        } else {
+            &[0, 1, 2, 3, 5, 8]
+        };
+        let mut widths = self.widths;
+        for &idx in columns {
+            widths[idx] = widths[idx].min(interactive_max_column_width(idx));
+        }
+
+        let separators_width = columns.len().saturating_sub(1) * 2;
+        while columns.iter().map(|idx| widths[*idx]).sum::<usize>() + separators_width > width {
+            let mut reduced = false;
+            for idx in [8, 1, 0] {
+                if columns.contains(&idx) && widths[idx] > interactive_min_column_width(idx) {
+                    widths[idx] -= 1;
+                    reduced = true;
+                    break;
+                }
+            }
+            if !reduced {
+                bail!("terminal is too narrow for interactive account selection");
+            }
+        }
+
+        let header = render_interactive_columns(&TABLE_HEADERS, columns, &widths);
+        let rows = self
+            .rows
+            .iter()
+            .map(|row| fit_menu_line(&render_interactive_columns(row, columns, &widths), width))
+            .collect();
+        Ok((fit_menu_line(&header, width), rows))
+    }
+}
+
+fn interactive_max_column_width(idx: usize) -> usize {
+    match idx {
+        0 => 28,
+        1 => 26,
+        8 => 24,
+        _ => usize::MAX,
+    }
+}
+
+fn interactive_min_column_width(idx: usize) -> usize {
+    match idx {
+        0 | 1 => 12,
+        8 => 5,
+        _ => TABLE_HEADERS[idx].len(),
+    }
+}
+
+fn render_interactive_columns<T>(
+    values: &[T],
+    columns: &[usize],
+    widths: &[usize; TABLE_HEADERS.len()],
+) -> String
+where
+    T: AsRef<str>,
+{
+    columns
+        .iter()
+        .map(|idx| {
+            let alignment = if matches!(*idx, 3 | 5 | 7) {
+                Alignment::Right
+            } else {
+                Alignment::Left
+            };
+            pad_str(values[*idx].as_ref(), widths[*idx], alignment, Some("...")).into_owned()
+        })
+        .collect::<Vec<_>>()
+        .join("  ")
+}
+
+fn print_table(results: &[AccountProbeResult]) {
+    let color_enabled = stdout_is_tty();
+    let table = AccountTable::new(results);
+    println!("{}", table.header(color_enabled));
+    for (idx, result) in results.iter().enumerate() {
+        println!("{}", table.row(idx, result, color_enabled));
+    }
+}
+
+fn run_interactive_switch(ctx: &AppContext, args: &SwitchArgs) -> Result<()> {
+    if !std::io::stdin().is_terminal() || !std::io::stderr().is_terminal() {
+        bail!(
+            "switch requires an interactive terminal; use `codex-accounts use <selector>` in scripts"
         );
+    }
+
+    let results = load_or_probe(ctx, args.refresh)?;
+    let Some(selected_idx) = select_account_interactively(&results)? else {
+        println!("Anulowano.");
+        return Ok(());
+    };
+    let selected = &results[selected_idx];
+
+    let confirmed = {
+        let stdin = std::io::stdin();
+        let stderr = std::io::stderr();
+        let mut reader = stdin.lock();
+        let mut writer = stderr.lock();
+        confirm_account_switch(&mut reader, &mut writer, &selected.auth_file)?
+    };
+    if !confirmed {
+        println!("Anulowano.");
+        return Ok(());
+    }
+
+    switch_to(ctx, selected)?;
+    clear_cache(ctx)?;
+    println!(
+        "Switched to {} ({})",
+        selected.auth_file, selected.account_label
+    );
+    Ok(())
+}
+
+fn select_account_interactively(results: &[AccountProbeResult]) -> Result<Option<usize>> {
+    if results.is_empty() {
+        bail!("no accounts are available to select");
+    }
+
+    let term = Term::stderr();
+    let (terminal_rows, terminal_cols) = term.size();
+    let menu_width = usize::from(terminal_cols).saturating_sub(2);
+    if menu_width < 20 {
+        bail!("terminal is too narrow for interactive account selection");
+    }
+
+    let table = AccountTable::new(results);
+    let (header, items) = table.interactive(menu_width)?;
+    let default_idx = results
+        .iter()
+        .position(|result| result.is_current)
+        .unwrap_or(0);
+    let page_size = usize::from(terminal_rows)
+        .saturating_sub(4)
+        .clamp(1, results.len());
+    let theme = ColorfulTheme {
+        active_item_style: Style::new().for_stderr().reverse().bold(),
+        ..ColorfulTheme::default()
+    };
+
+    term.write_line("Wybierz konto (↑/↓, Enter; Esc/q — anuluj):")
+        .context("failed to render interactive account selector")?;
+    term.write_line(&format!("  {header}"))
+        .context("failed to render interactive account table header")?;
+
+    Select::with_theme(&theme)
+        .items(&items)
+        .default(default_idx)
+        .max_length(page_size)
+        .report(false)
+        .interact_on_opt(&term)
+        .context("interactive account selection failed")
+}
+
+fn fit_menu_line(text: &str, width: usize) -> String {
+    pad_str(text, width, Alignment::Left, Some("...")).into_owned()
+}
+
+fn confirm_account_switch<R, W>(reader: &mut R, writer: &mut W, auth_file: &str) -> Result<bool>
+where
+    R: BufRead,
+    W: Write,
+{
+    loop {
+        write!(writer, "Czy chcesz zmienić konto na: {auth_file} [t/n]: ")
+            .context("failed to render account switch confirmation")?;
+        writer
+            .flush()
+            .context("failed to flush account switch confirmation")?;
+
+        let mut answer = String::new();
+        let bytes_read = match reader.read_line(&mut answer) {
+            Ok(bytes_read) => bytes_read,
+            Err(err) if err.kind() == std::io::ErrorKind::Interrupted => return Ok(false),
+            Err(err) => return Err(err).context("failed to read account switch confirmation"),
+        };
+        if bytes_read == 0 {
+            return Ok(false);
+        }
+
+        match parse_confirmation(&answer) {
+            Some(confirmed) => return Ok(confirmed),
+            None => {
+                writeln!(writer, "Wpisz t lub n.")
+                    .context("failed to render account switch confirmation error")?;
+            }
+        }
+    }
+}
+
+fn parse_confirmation(input: &str) -> Option<bool> {
+    match input.trim() {
+        "t" | "T" => Some(true),
+        "n" | "N" => Some(false),
+        _ => None,
     }
 }
 
 fn print_use_best_preview(selected: &AccountProbeResult) {
     let color_enabled = stdout_is_tty();
     println!(
-        "{} -> {} | weekly left {}",
+        "{} -> {} | 5h left {} | weekly left {}",
         paint(&selected.auth_file, ANSI_BOLD_GREEN, color_enabled),
         paint(&selected.account_label, ANSI_BOLD_GREEN, color_enabled),
+        paint(
+            &format_left(selected.five_hour.as_ref()),
+            color_for_percent(five_hour_left_percent(selected)),
+            color_enabled,
+        ),
         paint(
             &format_left(selected.weekly.as_ref()),
             color_for_percent(weekly_left_percent(selected)),
@@ -944,6 +1194,14 @@ fn weekly_left_percent(result: &AccountProbeResult) -> f64 {
         .unwrap_or(0.0)
 }
 
+fn five_hour_left_percent(result: &AccountProbeResult) -> f64 {
+    result
+        .five_hour
+        .as_ref()
+        .map(|item| item.left_percent)
+        .unwrap_or(0.0)
+}
+
 fn truncate(text: &str, max_len: usize) -> String {
     if text.len() <= max_len {
         text.to_string()
@@ -1030,6 +1288,11 @@ fn compare_best_candidate(left: &AccountProbeResult, right: &AccountProbeResult)
     weekly_left_percent(left)
         .partial_cmp(&weekly_left_percent(right))
         .unwrap_or(Ordering::Equal)
+        .then_with(|| {
+            five_hour_left_percent(left)
+                .partial_cmp(&five_hour_left_percent(right))
+                .unwrap_or(Ordering::Equal)
+        })
         .then_with(|| right.auth_file.cmp(&left.auth_file))
 }
 
@@ -1037,6 +1300,7 @@ fn rank_best_candidates(results: &[AccountProbeResult]) -> Vec<&AccountProbeResu
     let mut candidates: Vec<&AccountProbeResult> = results
         .iter()
         .filter(|result| matches!(result.status, ProbeStatus::Ok))
+        .filter(|result| result.weekly.is_some())
         .collect();
     candidates.sort_by(|left, right| compare_best_candidate(right, left));
     candidates
@@ -1330,6 +1594,86 @@ mod tests {
         assert_eq!(response.reset_credits.unwrap().available_count, 2);
     }
 
+    #[test]
+    fn parses_switch_command_with_refresh() {
+        let cli = Cli::try_parse_from(["codex-accounts", "switch", "--refresh"]).unwrap();
+
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Switch(SwitchArgs { refresh: true }))
+        ));
+    }
+
+    #[test]
+    fn parses_polish_confirmation_answers() {
+        assert_eq!(parse_confirmation("t\n"), Some(true));
+        assert_eq!(parse_confirmation(" T "), Some(true));
+        assert_eq!(parse_confirmation("n\n"), Some(false));
+        assert_eq!(parse_confirmation(" N "), Some(false));
+        assert_eq!(parse_confirmation("y\n"), None);
+        assert_eq!(parse_confirmation("\n"), None);
+    }
+
+    #[test]
+    fn confirmation_reprompts_until_t_or_n() {
+        let mut input = std::io::Cursor::new(b"maybe\nT\n");
+        let mut output = Vec::new();
+
+        let confirmed = confirm_account_switch(&mut input, &mut output, "alpha.json").unwrap();
+        let output = String::from_utf8(output).unwrap();
+
+        assert!(confirmed);
+        assert_eq!(output.matches("[t/n]:").count(), 2);
+        assert!(output.contains("Wpisz t lub n."));
+    }
+
+    #[test]
+    fn confirmation_eof_cancels_switch() {
+        let mut input = std::io::Cursor::new(Vec::<u8>::new());
+        let mut output = Vec::new();
+
+        let confirmed = confirm_account_switch(&mut input, &mut output, "alpha.json").unwrap();
+
+        assert!(!confirmed);
+    }
+
+    #[test]
+    fn menu_line_is_padded_or_truncated_to_terminal_width() {
+        assert_eq!(
+            console::measure_text_width(&fit_menu_line("account", 12)),
+            12
+        );
+        assert_eq!(fit_menu_line("a very long account row", 10), "a very ...");
+    }
+
+    #[test]
+    fn narrow_interactive_table_keeps_both_usage_windows_visible() {
+        let results = vec![sample_result_with_windows("alpha.json", 75.0, 60.0)];
+        let table = AccountTable::new(&results);
+
+        let (header, rows) = table.interactive(78).unwrap();
+
+        assert!(header.contains("5h left"));
+        assert!(header.contains("weekly left"));
+        assert!(header.contains("status"));
+        assert!(!header.contains("5h reset"));
+        assert_eq!(console::measure_text_width(&header), 78);
+        assert_eq!(console::measure_text_width(&rows[0]), 78);
+        assert!(rows[0].contains("75%"));
+        assert!(rows[0].contains("60%"));
+    }
+
+    #[test]
+    fn wide_interactive_table_includes_all_list_columns() {
+        let results = vec![sample_result("alpha.json", 60.0)];
+        let table = AccountTable::new(&results);
+
+        let (header, _) = table.interactive(160).unwrap();
+
+        for expected in ["5h reset", "weekly reset", "resets", "status"] {
+            assert!(header.contains(expected));
+        }
+    }
 
     #[test]
     fn maps_primary_5h_and_secondary_weekly_windows() {
@@ -1406,6 +1750,19 @@ mod tests {
 
         let selected = select_best_candidate(&ctx, &results, false).unwrap();
         assert_eq!(selected.auth_file, "higher.json");
+    }
+
+    #[test]
+    fn select_best_uses_5h_limit_to_break_weekly_ties() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let ctx = sample_ctx(&tempdir);
+        let results = vec![
+            sample_result_with_windows("lower-5h.json", 20.0, 60.0),
+            sample_result_with_windows("higher-5h.json", 80.0, 60.0),
+        ];
+
+        let selected = select_best_candidate(&ctx, &results, false).unwrap();
+        assert_eq!(selected.auth_file, "higher-5h.json");
     }
 
     #[test]
