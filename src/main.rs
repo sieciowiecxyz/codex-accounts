@@ -20,6 +20,8 @@ const CACHE_TTL_SECS: i64 = 45;
 const PROBE_TIMEOUT_SECS: u64 = 8;
 const MAX_CONCURRENCY: usize = 4;
 const USE_BEST_LOCK_TTL_SECS: u64 = 300;
+const FIVE_HOUR_WINDOW_MINS: u64 = 5 * 60;
+const WEEKLY_WINDOW_MINS: u64 = 7 * 24 * 60;
 const ANSI_RESET: &str = "\x1b[0m";
 const ANSI_GREEN: &str = "\x1b[32m";
 const ANSI_YELLOW: &str = "\x1b[33m";
@@ -92,6 +94,7 @@ struct AccountProbeResult {
     account_label: String,
     email: Option<String>,
     plan_type: Option<String>,
+    five_hour: Option<WindowSummary>,
     weekly: Option<WindowSummary>,
     reset_credits: Option<u64>,
     status: ProbeStatus,
@@ -168,6 +171,8 @@ struct RateLimitSnapshot {
 struct RateLimitWindow {
     #[serde(rename = "usedPercent")]
     used_percent: f64,
+    #[serde(rename = "windowDurationMins")]
+    window_duration_mins: Option<u64>,
     #[serde(rename = "resetsAt")]
     resets_at: Option<i64>,
 }
@@ -280,7 +285,7 @@ fn app_context() -> Result<AppContext> {
     };
     let accounts_root = codex_root.join("accounts");
     let tmp_root = codex_root.join("tmp").join("codex-accounts");
-    let cache_path = tmp_root.join("cache-v3.json");
+    let cache_path = tmp_root.join("cache-v4.json");
     fs::create_dir_all(&accounts_root)
         .with_context(|| format!("failed to create {}", accounts_root.display()))?;
     fs::create_dir_all(&tmp_root)
@@ -461,6 +466,7 @@ fn probe_single_auth(ctx: &AppContext, auth_file: &AuthFile) -> AccountProbeResu
             account_label: "<unavailable>".to_string(),
             email: None,
             plan_type: None,
+            five_hour: None,
             weekly: None,
             reset_credits: None,
             status: ProbeStatus::Error(err.to_string()),
@@ -511,22 +517,22 @@ fn probe_single_auth_inner(ctx: &AppContext, auth_file: &AuthFile) -> Result<Acc
         None => ("<unknown>".to_string(), None, None),
     };
 
-    let (weekly, reset_credits) = match rpc_request::<_, RateLimitReadResult>(
+    let (five_hour, weekly, reset_credits) = match rpc_request::<_, RateLimitReadResult>(
         &mut websocket,
         3,
         "account/rateLimits/read",
         Value::Null,
     ) {
-        Ok(rate_limits) => (
-            rate_limits
-                .rate_limits
-                .primary
-                .or(rate_limits.rate_limits.secondary)
-                .map(window_summary),
-            rate_limits
-                .reset_credits
-                .map(|credits| credits.available_count),
-        ),
+        Ok(rate_limits) => {
+            let (five_hour, weekly) = split_rate_limit_windows(rate_limits.rate_limits);
+            (
+                five_hour,
+                weekly,
+                rate_limits
+                    .reset_credits
+                    .map(|credits| credits.available_count),
+            )
+        }
         Err(err) => {
             let _ = websocket.close(None);
             return Ok(AccountProbeResult {
@@ -536,6 +542,7 @@ fn probe_single_auth_inner(ctx: &AppContext, auth_file: &AuthFile) -> Result<Acc
                 account_label,
                 email,
                 plan_type,
+                five_hour: None,
                 weekly: None,
                 reset_credits: None,
                 status: ProbeStatus::Error(err.to_string()),
@@ -552,6 +559,7 @@ fn probe_single_auth_inner(ctx: &AppContext, auth_file: &AuthFile) -> Result<Acc
         account_label,
         email,
         plan_type,
+        five_hour,
         weekly,
         reset_credits,
         status: ProbeStatus::Ok,
@@ -656,9 +664,63 @@ fn window_summary(window: RateLimitWindow) -> WindowSummary {
     }
 }
 
+fn split_rate_limit_windows(
+    snapshot: RateLimitSnapshot,
+) -> (Option<WindowSummary>, Option<WindowSummary>) {
+    let windows = [snapshot.primary, snapshot.secondary];
+    let mut five_hour_idx = window_index_for_duration(&windows, FIVE_HOUR_WINDOW_MINS, None);
+    let mut weekly_idx = window_index_for_duration(&windows, WEEKLY_WINDOW_MINS, five_hour_idx);
+
+    // Older app-server versions did not always report the duration. In that protocol,
+    // primary is the short (5h) window and secondary is the weekly window.
+    if five_hour_idx.is_none() && windows[0].is_some() && weekly_idx != Some(0) {
+        five_hour_idx = Some(0);
+    }
+    if weekly_idx.is_none() && windows[1].is_some() && five_hour_idx != Some(1) {
+        weekly_idx = Some(1);
+    }
+
+    // Keep a single known-duration window correctly classified even if it arrives
+    // in the opposite protocol slot.
+    if five_hour_idx.is_none() {
+        five_hour_idx = windows
+            .iter()
+            .enumerate()
+            .find(|(idx, window)| window.is_some() && weekly_idx != Some(*idx))
+            .map(|(idx, _)| idx);
+    }
+    if weekly_idx.is_none() {
+        weekly_idx = windows
+            .iter()
+            .enumerate()
+            .find(|(idx, window)| window.is_some() && five_hour_idx != Some(*idx))
+            .map(|(idx, _)| idx);
+    }
+
+    let summary_at =
+        |idx: Option<usize>| idx.and_then(|idx| windows[idx].clone()).map(window_summary);
+    (summary_at(five_hour_idx), summary_at(weekly_idx))
+}
+
+fn window_index_for_duration(
+    windows: &[Option<RateLimitWindow>; 2],
+    duration_mins: u64,
+    excluded_idx: Option<usize>,
+) -> Option<usize> {
+    windows.iter().enumerate().find_map(|(idx, window)| {
+        (excluded_idx != Some(idx)
+            && window
+                .as_ref()
+                .and_then(|window| window.window_duration_mins)
+                == Some(duration_mins))
+        .then_some(idx)
+    })
+}
+
 fn compare_results(left: &AccountProbeResult, right: &AccountProbeResult) -> Ordering {
     compare_status(left, right)
         .then_with(|| compare_window(left.weekly.as_ref(), right.weekly.as_ref()))
+        .then_with(|| compare_window(left.five_hour.as_ref(), right.five_hour.as_ref()))
         .then_with(|| left.auth_file.cmp(&right.auth_file))
 }
 
@@ -1227,7 +1289,11 @@ mod tests {
         }
     }
 
-    fn sample_result(auth_file: &str, weekly_left: f64) -> AccountProbeResult {
+    fn sample_result_with_windows(
+        auth_file: &str,
+        five_hour_left: f64,
+        weekly_left: f64,
+    ) -> AccountProbeResult {
         AccountProbeResult {
             auth_file: auth_file.to_string(),
             auth_path: PathBuf::from(format!("/tmp/{auth_file}")),
@@ -1235,9 +1301,22 @@ mod tests {
             account_label: auth_file.to_string(),
             email: Some(format!("{auth_file}@example.com")),
             plan_type: Some("plus".to_string()),
+            five_hour: Some(sample_window(five_hour_left)),
             weekly: Some(sample_window(weekly_left)),
             reset_credits: None,
             status: ProbeStatus::Ok,
+        }
+    }
+
+    fn sample_result(auth_file: &str, weekly_left: f64) -> AccountProbeResult {
+        sample_result_with_windows(auth_file, 50.0, weekly_left)
+    }
+
+    fn rate_limit_window(used_percent: f64, duration_mins: Option<u64>) -> RateLimitWindow {
+        RateLimitWindow {
+            used_percent,
+            window_duration_mins: duration_mins,
+            resets_at: None,
         }
     }
 
@@ -1249,6 +1328,59 @@ mod tests {
         .unwrap();
 
         assert_eq!(response.reset_credits.unwrap().available_count, 2);
+    }
+
+
+    #[test]
+    fn maps_primary_5h_and_secondary_weekly_windows() {
+        let snapshot = RateLimitSnapshot {
+            primary: Some(rate_limit_window(15.0, Some(FIVE_HOUR_WINDOW_MINS))),
+            secondary: Some(rate_limit_window(35.0, Some(WEEKLY_WINDOW_MINS))),
+        };
+
+        let (five_hour, weekly) = split_rate_limit_windows(snapshot);
+
+        assert_eq!(five_hour.unwrap().left_percent, 85.0);
+        assert_eq!(weekly.unwrap().left_percent, 65.0);
+    }
+
+    #[test]
+    fn maps_windows_by_duration_even_when_protocol_slots_are_swapped() {
+        let snapshot = RateLimitSnapshot {
+            primary: Some(rate_limit_window(35.0, Some(WEEKLY_WINDOW_MINS))),
+            secondary: Some(rate_limit_window(15.0, Some(FIVE_HOUR_WINDOW_MINS))),
+        };
+
+        let (five_hour, weekly) = split_rate_limit_windows(snapshot);
+
+        assert_eq!(five_hour.unwrap().left_percent, 85.0);
+        assert_eq!(weekly.unwrap().left_percent, 65.0);
+    }
+
+    #[test]
+    fn falls_back_to_primary_and_secondary_for_legacy_windows_without_duration() {
+        let snapshot = RateLimitSnapshot {
+            primary: Some(rate_limit_window(15.0, None)),
+            secondary: Some(rate_limit_window(35.0, None)),
+        };
+
+        let (five_hour, weekly) = split_rate_limit_windows(snapshot);
+
+        assert_eq!(five_hour.unwrap().left_percent, 85.0);
+        assert_eq!(weekly.unwrap().left_percent, 65.0);
+    }
+
+    #[test]
+    fn keeps_single_weekly_window_out_of_5h_column() {
+        let snapshot = RateLimitSnapshot {
+            primary: Some(rate_limit_window(35.0, Some(WEEKLY_WINDOW_MINS))),
+            secondary: None,
+        };
+
+        let (five_hour, weekly) = split_rate_limit_windows(snapshot);
+
+        assert!(five_hour.is_none());
+        assert_eq!(weekly.unwrap().left_percent, 65.0);
     }
 
     fn lock_account(result: &AccountProbeResult, expires_at: i64, tempdir: &tempfile::TempDir) {
