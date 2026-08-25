@@ -687,33 +687,42 @@ fn split_rate_limit_windows(
 
     // Older app-server versions did not always report the duration. In that protocol,
     // primary is the short (5h) window and secondary is the weekly window.
-    if five_hour_idx.is_none() && windows[0].is_some() && weekly_idx != Some(0) {
+    if five_hour_idx.is_none() && window_has_unknown_duration(&windows[0]) && weekly_idx != Some(0)
+    {
         five_hour_idx = Some(0);
     }
-    if weekly_idx.is_none() && windows[1].is_some() && five_hour_idx != Some(1) {
+    if weekly_idx.is_none() && window_has_unknown_duration(&windows[1]) && five_hour_idx != Some(1)
+    {
         weekly_idx = Some(1);
     }
 
-    // Keep a single known-duration window correctly classified even if it arrives
-    // in the opposite protocol slot.
+    // If an exact match occupies the opposite protocol slot, the remaining
+    // durationless legacy window can still be assigned without relabeling an
+    // explicitly described unknown duration.
     if five_hour_idx.is_none() {
         five_hour_idx = windows
             .iter()
             .enumerate()
-            .find(|(idx, window)| window.is_some() && weekly_idx != Some(*idx))
+            .find(|(idx, window)| window_has_unknown_duration(window) && weekly_idx != Some(*idx))
             .map(|(idx, _)| idx);
     }
     if weekly_idx.is_none() {
         weekly_idx = windows
             .iter()
             .enumerate()
-            .find(|(idx, window)| window.is_some() && five_hour_idx != Some(*idx))
+            .find(|(idx, window)| {
+                window_has_unknown_duration(window) && five_hour_idx != Some(*idx)
+            })
             .map(|(idx, _)| idx);
     }
 
     let summary_at =
         |idx: Option<usize>| idx.and_then(|idx| windows[idx].clone()).map(window_summary);
     (summary_at(five_hour_idx), summary_at(weekly_idx))
+}
+
+fn window_has_unknown_duration(window: &Option<RateLimitWindow>) -> bool {
+    matches!(window, Some(window) if window.window_duration_mins.is_none())
 }
 
 fn window_index_for_duration(
@@ -1724,6 +1733,45 @@ mod tests {
         let (five_hour, weekly) = split_rate_limit_windows(snapshot);
 
         assert!(five_hour.is_none());
+        assert_eq!(weekly.unwrap().left_percent, 65.0);
+    }
+
+    #[test]
+    fn does_not_label_explicit_unknown_primary_duration_as_5h() {
+        let snapshot = RateLimitSnapshot {
+            primary: Some(rate_limit_window(15.0, Some(60))),
+            secondary: Some(rate_limit_window(35.0, Some(WEEKLY_WINDOW_MINS))),
+        };
+
+        let (five_hour, weekly) = split_rate_limit_windows(snapshot);
+
+        assert!(five_hour.is_none());
+        assert_eq!(weekly.unwrap().left_percent, 65.0);
+    }
+
+    #[test]
+    fn does_not_label_explicit_unknown_secondary_duration_as_5h() {
+        let snapshot = RateLimitSnapshot {
+            primary: Some(rate_limit_window(35.0, Some(WEEKLY_WINDOW_MINS))),
+            secondary: Some(rate_limit_window(15.0, Some(30 * 24 * 60))),
+        };
+
+        let (five_hour, weekly) = split_rate_limit_windows(snapshot);
+
+        assert!(five_hour.is_none());
+        assert_eq!(weekly.unwrap().left_percent, 65.0);
+    }
+
+    #[test]
+    fn maps_remaining_durationless_window_after_exact_weekly_match() {
+        let snapshot = RateLimitSnapshot {
+            primary: Some(rate_limit_window(35.0, Some(WEEKLY_WINDOW_MINS))),
+            secondary: Some(rate_limit_window(15.0, None)),
+        };
+
+        let (five_hour, weekly) = split_rate_limit_windows(snapshot);
+
+        assert_eq!(five_hour.unwrap().left_percent, 85.0);
         assert_eq!(weekly.unwrap().left_percent, 65.0);
     }
 
