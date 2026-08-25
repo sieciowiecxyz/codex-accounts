@@ -7,6 +7,8 @@ edition = "2021"
 anyhow = "1.0"
 chrono = { version = "0.4", features = ["clock", "serde"] }
 clap = { version = "4.5", features = ["derive"] }
+console = "0.16"
+dialoguer = { version = "0.12", default-features = false }
 dirs = "6.0"
 rayon = "1.10"
 serde = { version = "1.0", features = ["derive"] }
