@@ -1,6 +1,6 @@
 use std::cmp::Ordering;
 use std::fs;
-use std::io::{IsTerminal, Write};
+use std::io::{BufRead, IsTerminal, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -10,6 +10,8 @@ use std::time::{Duration, Instant};
 use anyhow::{anyhow, bail, Context, Result};
 use chrono::{Local, TimeZone};
 use clap::{Args, Parser, Subcommand};
+use console::{pad_str, Alignment, Style, Term};
+use dialoguer::{theme::ColorfulTheme, Select};
 use rayon::prelude::*;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -20,6 +22,8 @@ const CACHE_TTL_SECS: i64 = 45;
 const PROBE_TIMEOUT_SECS: u64 = 8;
 const MAX_CONCURRENCY: usize = 4;
 const USE_BEST_LOCK_TTL_SECS: u64 = 300;
+const FIVE_HOUR_WINDOW_MINS: u64 = 5 * 60;
+const WEEKLY_WINDOW_MINS: u64 = 7 * 24 * 60;
 const ANSI_RESET: &str = "\x1b[0m";
 const ANSI_GREEN: &str = "\x1b[32m";
 const ANSI_YELLOW: &str = "\x1b[33m";
@@ -39,6 +43,8 @@ struct Cli {
 enum Commands {
     List(ListArgs),
     Use(SelectorArgs),
+    /// Interactively select an account and switch after confirmation.
+    Switch(SwitchArgs),
     UseBest(UseBestArgs),
     ImportNew,
     Remove(SelectorArgs),
@@ -55,6 +61,13 @@ struct ListArgs {
 #[derive(Args, Debug)]
 struct SelectorArgs {
     selector: String,
+}
+
+#[derive(Args, Debug, Clone)]
+struct SwitchArgs {
+    /// Refresh usage before showing the account list.
+    #[arg(long)]
+    refresh: bool,
 }
 
 #[derive(Args, Debug)]
@@ -92,8 +105,8 @@ struct AccountProbeResult {
     account_label: String,
     email: Option<String>,
     plan_type: Option<String>,
-    primary: Option<WindowSummary>,
-    secondary: Option<WindowSummary>,
+    five_hour: Option<WindowSummary>,
+    weekly: Option<WindowSummary>,
     reset_credits: Option<u64>,
     status: ProbeStatus,
 }
@@ -169,6 +182,8 @@ struct RateLimitSnapshot {
 struct RateLimitWindow {
     #[serde(rename = "usedPercent")]
     used_percent: f64,
+    #[serde(rename = "windowDurationMins")]
+    window_duration_mins: Option<u64>,
     #[serde(rename = "resetsAt")]
     resets_at: Option<i64>,
 }
@@ -237,6 +252,9 @@ fn main() -> Result<()> {
                 selected.auth_file, selected.account_label
             );
         }
+        Commands::Switch(args) => {
+            run_interactive_switch(&ctx, &args)?;
+        }
         Commands::Remove(args) => {
             let results = load_or_probe(&ctx, false)?;
             let selected = resolve_selector(&results, &args.selector)?;
@@ -281,7 +299,7 @@ fn app_context() -> Result<AppContext> {
     };
     let accounts_root = codex_root.join("accounts");
     let tmp_root = codex_root.join("tmp").join("codex-accounts");
-    let cache_path = tmp_root.join("cache-v3.json");
+    let cache_path = tmp_root.join("cache-v4.json");
     fs::create_dir_all(&accounts_root)
         .with_context(|| format!("failed to create {}", accounts_root.display()))?;
     fs::create_dir_all(&tmp_root)
@@ -462,8 +480,8 @@ fn probe_single_auth(ctx: &AppContext, auth_file: &AuthFile) -> AccountProbeResu
             account_label: "<unavailable>".to_string(),
             email: None,
             plan_type: None,
-            primary: None,
-            secondary: None,
+            five_hour: None,
+            weekly: None,
             reset_credits: None,
             status: ProbeStatus::Error(err.to_string()),
         },
@@ -475,35 +493,22 @@ fn probe_single_auth_inner(ctx: &AppContext, auth_file: &AuthFile) -> Result<Acc
         .prefix("probe-")
         .tempdir_in(&ctx.tmp_root)
         .with_context(|| format!("failed to create temp dir in {}", ctx.tmp_root.display()))?;
-    let temp_path = temp_dir.path().to_path_buf();
-    let result = probe_auth_in_dir(ctx, auth_file, &temp_path);
-    temp_dir
-        .close()
-        .with_context(|| format!("failed to remove probe directory {}", temp_path.display()))?;
-    result
-}
-
-fn probe_auth_in_dir(
-    ctx: &AppContext,
-    auth_file: &AuthFile,
-    probe_dir: &Path,
-) -> Result<AccountProbeResult> {
-    fs::write(probe_dir.join("auth.json"), &auth_file.bytes).with_context(|| {
+    fs::write(temp_dir.path().join("auth.json"), &auth_file.bytes).with_context(|| {
         format!(
             "failed to write temp auth for {} into {}",
             auth_file.path.display(),
-            probe_dir.display()
+            temp_dir.path().display()
         )
     })?;
 
     let config_path = ctx.codex_root.join("config.toml");
     if config_path.exists() {
-        let _ = fs::copy(&config_path, probe_dir.join("config.toml"));
+        let _ = fs::copy(&config_path, temp_dir.path().join("config.toml"));
     }
 
     let port = reserve_port()?;
     let app_server_url = format!("ws://127.0.0.1:{port}");
-    let mut child = ChildGuard::spawn(&app_server_url, probe_dir)?;
+    let mut child = ChildGuard::spawn(&app_server_url, temp_dir.path())?;
     let mut websocket = connect_when_ready(port, &mut child)?;
 
     let _: Value = rpc_request(
@@ -526,19 +531,22 @@ fn probe_auth_in_dir(
         None => ("<unknown>".to_string(), None, None),
     };
 
-    let (primary, secondary, reset_credits) = match rpc_request::<_, RateLimitReadResult>(
+    let (five_hour, weekly, reset_credits) = match rpc_request::<_, RateLimitReadResult>(
         &mut websocket,
         3,
         "account/rateLimits/read",
         Value::Null,
     ) {
-        Ok(rate_limits) => (
-            rate_limits.rate_limits.primary.map(window_summary),
-            rate_limits.rate_limits.secondary.map(window_summary),
-            rate_limits
-                .reset_credits
-                .map(|credits| credits.available_count),
-        ),
+        Ok(rate_limits) => {
+            let (five_hour, weekly) = split_rate_limit_windows(rate_limits.rate_limits);
+            (
+                five_hour,
+                weekly,
+                rate_limits
+                    .reset_credits
+                    .map(|credits| credits.available_count),
+            )
+        }
         Err(err) => {
             let _ = websocket.close(None);
             return Ok(AccountProbeResult {
@@ -548,8 +556,8 @@ fn probe_auth_in_dir(
                 account_label,
                 email,
                 plan_type,
-                primary: None,
-                secondary: None,
+                five_hour: None,
+                weekly: None,
                 reset_credits: None,
                 status: ProbeStatus::Error(err.to_string()),
             });
@@ -565,8 +573,8 @@ fn probe_auth_in_dir(
         account_label,
         email,
         plan_type,
-        primary,
-        secondary,
+        five_hour,
+        weekly,
         reset_credits,
         status: ProbeStatus::Ok,
     })
@@ -670,9 +678,72 @@ fn window_summary(window: RateLimitWindow) -> WindowSummary {
     }
 }
 
+fn split_rate_limit_windows(
+    snapshot: RateLimitSnapshot,
+) -> (Option<WindowSummary>, Option<WindowSummary>) {
+    let windows = [snapshot.primary, snapshot.secondary];
+    let mut five_hour_idx = window_index_for_duration(&windows, FIVE_HOUR_WINDOW_MINS, None);
+    let mut weekly_idx = window_index_for_duration(&windows, WEEKLY_WINDOW_MINS, five_hour_idx);
+
+    // Older app-server versions did not always report the duration. In that protocol,
+    // primary is the short (5h) window and secondary is the weekly window.
+    if five_hour_idx.is_none() && window_has_unknown_duration(&windows[0]) && weekly_idx != Some(0)
+    {
+        five_hour_idx = Some(0);
+    }
+    if weekly_idx.is_none() && window_has_unknown_duration(&windows[1]) && five_hour_idx != Some(1)
+    {
+        weekly_idx = Some(1);
+    }
+
+    // If an exact match occupies the opposite protocol slot, the remaining
+    // durationless legacy window can still be assigned without relabeling an
+    // explicitly described unknown duration.
+    if five_hour_idx.is_none() {
+        five_hour_idx = windows
+            .iter()
+            .enumerate()
+            .find(|(idx, window)| window_has_unknown_duration(window) && weekly_idx != Some(*idx))
+            .map(|(idx, _)| idx);
+    }
+    if weekly_idx.is_none() {
+        weekly_idx = windows
+            .iter()
+            .enumerate()
+            .find(|(idx, window)| {
+                window_has_unknown_duration(window) && five_hour_idx != Some(*idx)
+            })
+            .map(|(idx, _)| idx);
+    }
+
+    let summary_at =
+        |idx: Option<usize>| idx.and_then(|idx| windows[idx].clone()).map(window_summary);
+    (summary_at(five_hour_idx), summary_at(weekly_idx))
+}
+
+fn window_has_unknown_duration(window: &Option<RateLimitWindow>) -> bool {
+    matches!(window, Some(window) if window.window_duration_mins.is_none())
+}
+
+fn window_index_for_duration(
+    windows: &[Option<RateLimitWindow>; 2],
+    duration_mins: u64,
+    excluded_idx: Option<usize>,
+) -> Option<usize> {
+    windows.iter().enumerate().find_map(|(idx, window)| {
+        (excluded_idx != Some(idx)
+            && window
+                .as_ref()
+                .and_then(|window| window.window_duration_mins)
+                == Some(duration_mins))
+        .then_some(idx)
+    })
+}
+
 fn compare_results(left: &AccountProbeResult, right: &AccountProbeResult) -> Ordering {
     compare_status(left, right)
-        .then_with(|| compare_window(left.secondary.as_ref(), right.secondary.as_ref()))
+        .then_with(|| compare_window(left.weekly.as_ref(), right.weekly.as_ref()))
+        .then_with(|| compare_window(left.five_hour.as_ref(), right.five_hour.as_ref()))
         .then_with(|| left.auth_file.cmp(&right.auth_file))
 }
 
@@ -692,96 +763,313 @@ fn compare_window(left: Option<&WindowSummary>, right: Option<&WindowSummary>) -
         .unwrap_or(Ordering::Equal)
 }
 
-fn print_table(results: &[AccountProbeResult]) {
-    let headers = [
-        "auth",
-        "account",
-        "plan",
-        "5h left",
-        "5h reset",
-        "weekly left",
-        "weekly reset",
-        "resets",
-        "status",
-    ];
-    let color_enabled = stdout_is_tty();
+const TABLE_HEADERS: [&str; 9] = [
+    "auth",
+    "account",
+    "plan",
+    "5h left",
+    "5h reset",
+    "weekly left",
+    "weekly reset",
+    "resets",
+    "status",
+];
 
-    let mut rows = Vec::with_capacity(results.len());
-    for result in results {
-        rows.push(vec![
-            if result.is_current {
-                format!("{} *", result.auth_file)
-            } else {
-                result.auth_file.clone()
-            },
-            result.account_label.clone(),
-            result.plan_type.clone().unwrap_or_else(|| "-".to_string()),
-            format_left(result.primary.as_ref()),
-            format_reset(result.primary.as_ref()),
-            format_left(result.secondary.as_ref()),
-            format_reset(result.secondary.as_ref()),
-            format_reset_credits(result.reset_credits),
-            format_status(&result.status),
-        ]);
-    }
+struct AccountTable {
+    rows: Vec<Vec<String>>,
+    widths: [usize; TABLE_HEADERS.len()],
+}
 
-    let mut widths = headers.map(str::len);
-    for row in &rows {
-        for (idx, value) in row.iter().enumerate() {
-            widths[idx] = widths[idx].max(value.len());
+impl AccountTable {
+    fn new(results: &[AccountProbeResult]) -> Self {
+        let rows = results
+            .iter()
+            .map(|result| {
+                vec![
+                    if result.is_current {
+                        format!("{} *", result.auth_file)
+                    } else {
+                        result.auth_file.clone()
+                    },
+                    result.account_label.clone(),
+                    result.plan_type.clone().unwrap_or_else(|| "-".to_string()),
+                    format_left(result.five_hour.as_ref()),
+                    format_reset(result.five_hour.as_ref()),
+                    format_left(result.weekly.as_ref()),
+                    format_reset(result.weekly.as_ref()),
+                    format_reset_credits(result.reset_credits),
+                    format_status(&result.status),
+                ]
+            })
+            .collect::<Vec<_>>();
+
+        let mut widths = TABLE_HEADERS.map(str::len);
+        for row in &rows {
+            for (idx, value) in row.iter().enumerate() {
+                widths[idx] = widths[idx].max(value.len());
+            }
         }
+
+        Self { rows, widths }
     }
 
-    println!(
-        "{}  {}  {}  {}  {}  {}  {}  {}  {}",
-        render_header(headers[0], widths[0], false, color_enabled),
-        render_header(headers[1], widths[1], false, color_enabled),
-        render_header(headers[2], widths[2], false, color_enabled),
-        render_header(headers[3], widths[3], true, color_enabled),
-        render_header(headers[4], widths[4], false, color_enabled),
-        render_header(headers[5], widths[5], true, color_enabled),
-        render_header(headers[6], widths[6], false, color_enabled),
-        render_header(headers[7], widths[7], true, color_enabled),
-        render_header(headers[8], widths[8], false, color_enabled),
-    );
-
-    for (result, row) in results.iter().zip(rows) {
-        println!(
+    fn header(&self, color_enabled: bool) -> String {
+        format!(
             "{}  {}  {}  {}  {}  {}  {}  {}  {}",
-            render_auth_cell(&row[0], widths[0], result.is_current, color_enabled),
-            render_plain_cell(&row[1], widths[1], false, color_enabled, None),
-            render_plain_cell(&row[2], widths[2], false, color_enabled, None),
+            render_header(TABLE_HEADERS[0], self.widths[0], false, color_enabled),
+            render_header(TABLE_HEADERS[1], self.widths[1], false, color_enabled),
+            render_header(TABLE_HEADERS[2], self.widths[2], false, color_enabled),
+            render_header(TABLE_HEADERS[3], self.widths[3], true, color_enabled),
+            render_header(TABLE_HEADERS[4], self.widths[4], false, color_enabled),
+            render_header(TABLE_HEADERS[5], self.widths[5], true, color_enabled),
+            render_header(TABLE_HEADERS[6], self.widths[6], false, color_enabled),
+            render_header(TABLE_HEADERS[7], self.widths[7], true, color_enabled),
+            render_header(TABLE_HEADERS[8], self.widths[8], false, color_enabled),
+        )
+    }
+
+    fn row(&self, idx: usize, result: &AccountProbeResult, color_enabled: bool) -> String {
+        let row = &self.rows[idx];
+        format!(
+            "{}  {}  {}  {}  {}  {}  {}  {}  {}",
+            render_auth_cell(&row[0], self.widths[0], result.is_current, color_enabled),
+            render_plain_cell(&row[1], self.widths[1], false, color_enabled, None),
+            render_plain_cell(&row[2], self.widths[2], false, color_enabled, None),
             render_plain_cell(
                 &row[3],
-                widths[3],
+                self.widths[3],
                 true,
                 color_enabled,
-                Some(color_for_percent(primary_left_percent(result))),
+                Some(color_for_percent(five_hour_left_percent(result))),
             ),
-            render_plain_cell(&row[4], widths[4], false, color_enabled, None),
+            render_plain_cell(&row[4], self.widths[4], false, color_enabled, None),
             render_plain_cell(
                 &row[5],
-                widths[5],
+                self.widths[5],
                 true,
                 color_enabled,
                 Some(color_for_percent(weekly_left_percent(result))),
             ),
-            render_plain_cell(&row[6], widths[6], false, color_enabled, None),
+            render_plain_cell(&row[6], self.widths[6], false, color_enabled, None),
             render_plain_cell(
                 &row[7],
-                widths[7],
+                self.widths[7],
                 true,
                 color_enabled,
-                Some(color_for_reset_credits(result.reset_credits))
+                Some(color_for_reset_credits(result.reset_credits)),
             ),
             render_plain_cell(
                 &row[8],
-                widths[8],
+                self.widths[8],
                 false,
                 color_enabled,
                 Some(status_color(&result.status))
             ),
+        )
+    }
+
+    fn interactive(&self, width: usize) -> Result<(String, Vec<String>)> {
+        let columns: &[usize] = if width >= 140 {
+            &[0, 1, 2, 3, 4, 5, 6, 7, 8]
+        } else if width >= 105 {
+            &[0, 1, 2, 3, 4, 5, 6, 8]
+        } else {
+            &[0, 1, 2, 3, 5, 8]
+        };
+        let mut widths = self.widths;
+        for &idx in columns {
+            widths[idx] = widths[idx].min(interactive_max_column_width(idx));
+        }
+
+        let separators_width = columns.len().saturating_sub(1) * 2;
+        while columns.iter().map(|idx| widths[*idx]).sum::<usize>() + separators_width > width {
+            let mut reduced = false;
+            for idx in [8, 1, 0] {
+                if columns.contains(&idx) && widths[idx] > interactive_min_column_width(idx) {
+                    widths[idx] -= 1;
+                    reduced = true;
+                    break;
+                }
+            }
+            if !reduced {
+                bail!("terminal is too narrow for interactive account selection");
+            }
+        }
+
+        let header = render_interactive_columns(&TABLE_HEADERS, columns, &widths);
+        let rows = self
+            .rows
+            .iter()
+            .map(|row| fit_menu_line(&render_interactive_columns(row, columns, &widths), width))
+            .collect();
+        Ok((fit_menu_line(&header, width), rows))
+    }
+}
+
+fn interactive_max_column_width(idx: usize) -> usize {
+    match idx {
+        0 => 28,
+        1 => 26,
+        8 => 24,
+        _ => usize::MAX,
+    }
+}
+
+fn interactive_min_column_width(idx: usize) -> usize {
+    match idx {
+        0 | 1 => 12,
+        8 => 5,
+        _ => TABLE_HEADERS[idx].len(),
+    }
+}
+
+fn render_interactive_columns<T>(
+    values: &[T],
+    columns: &[usize],
+    widths: &[usize; TABLE_HEADERS.len()],
+) -> String
+where
+    T: AsRef<str>,
+{
+    columns
+        .iter()
+        .map(|idx| {
+            let alignment = if matches!(*idx, 3 | 5 | 7) {
+                Alignment::Right
+            } else {
+                Alignment::Left
+            };
+            pad_str(values[*idx].as_ref(), widths[*idx], alignment, Some("...")).into_owned()
+        })
+        .collect::<Vec<_>>()
+        .join("  ")
+}
+
+fn print_table(results: &[AccountProbeResult]) {
+    let color_enabled = stdout_is_tty();
+    let table = AccountTable::new(results);
+    println!("{}", table.header(color_enabled));
+    for (idx, result) in results.iter().enumerate() {
+        println!("{}", table.row(idx, result, color_enabled));
+    }
+}
+
+fn run_interactive_switch(ctx: &AppContext, args: &SwitchArgs) -> Result<()> {
+    if !std::io::stdin().is_terminal() || !std::io::stderr().is_terminal() {
+        bail!(
+            "switch requires an interactive terminal; use `codex-accounts use <selector>` in scripts"
         );
+    }
+
+    let results = load_or_probe(ctx, args.refresh)?;
+    let Some(selected_idx) = select_account_interactively(&results)? else {
+        println!("Anulowano.");
+        return Ok(());
+    };
+    let selected = &results[selected_idx];
+
+    let confirmed = {
+        let stdin = std::io::stdin();
+        let stderr = std::io::stderr();
+        let mut reader = stdin.lock();
+        let mut writer = stderr.lock();
+        confirm_account_switch(&mut reader, &mut writer, &selected.auth_file)?
+    };
+    if !confirmed {
+        println!("Anulowano.");
+        return Ok(());
+    }
+
+    switch_to(ctx, selected)?;
+    clear_cache(ctx)?;
+    println!(
+        "Switched to {} ({})",
+        selected.auth_file, selected.account_label
+    );
+    Ok(())
+}
+
+fn select_account_interactively(results: &[AccountProbeResult]) -> Result<Option<usize>> {
+    if results.is_empty() {
+        bail!("no accounts are available to select");
+    }
+
+    let term = Term::stderr();
+    let (terminal_rows, terminal_cols) = term.size();
+    let menu_width = usize::from(terminal_cols).saturating_sub(2);
+    if menu_width < 20 {
+        bail!("terminal is too narrow for interactive account selection");
+    }
+
+    let table = AccountTable::new(results);
+    let (header, items) = table.interactive(menu_width)?;
+    let default_idx = results
+        .iter()
+        .position(|result| result.is_current)
+        .unwrap_or(0);
+    let page_size = usize::from(terminal_rows)
+        .saturating_sub(4)
+        .clamp(1, results.len());
+    let theme = ColorfulTheme {
+        active_item_style: Style::new().for_stderr().reverse().bold(),
+        ..ColorfulTheme::default()
+    };
+
+    term.write_line("Wybierz konto (↑/↓, Enter; Esc/q — anuluj):")
+        .context("failed to render interactive account selector")?;
+    term.write_line(&format!("  {header}"))
+        .context("failed to render interactive account table header")?;
+
+    Select::with_theme(&theme)
+        .items(&items)
+        .default(default_idx)
+        .max_length(page_size)
+        .report(false)
+        .interact_on_opt(&term)
+        .context("interactive account selection failed")
+}
+
+fn fit_menu_line(text: &str, width: usize) -> String {
+    pad_str(text, width, Alignment::Left, Some("...")).into_owned()
+}
+
+fn confirm_account_switch<R, W>(reader: &mut R, writer: &mut W, auth_file: &str) -> Result<bool>
+where
+    R: BufRead,
+    W: Write,
+{
+    loop {
+        write!(writer, "Czy chcesz zmienić konto na: {auth_file} [t/n]: ")
+            .context("failed to render account switch confirmation")?;
+        writer
+            .flush()
+            .context("failed to flush account switch confirmation")?;
+
+        let mut answer = String::new();
+        let bytes_read = match reader.read_line(&mut answer) {
+            Ok(bytes_read) => bytes_read,
+            Err(err) if err.kind() == std::io::ErrorKind::Interrupted => return Ok(false),
+            Err(err) => return Err(err).context("failed to read account switch confirmation"),
+        };
+        if bytes_read == 0 {
+            return Ok(false);
+        }
+
+        match parse_confirmation(&answer) {
+            Some(confirmed) => return Ok(confirmed),
+            None => {
+                writeln!(writer, "Wpisz t lub n.")
+                    .context("failed to render account switch confirmation error")?;
+            }
+        }
+    }
+}
+
+fn parse_confirmation(input: &str) -> Option<bool> {
+    match input.trim() {
+        "t" | "T" => Some(true),
+        "n" | "N" => Some(false),
+        _ => None,
     }
 }
 
@@ -792,14 +1080,14 @@ fn print_use_best_preview(selected: &AccountProbeResult) {
         paint(&selected.auth_file, ANSI_BOLD_GREEN, color_enabled),
         paint(&selected.account_label, ANSI_BOLD_GREEN, color_enabled),
         paint(
-            &format_left(selected.primary.as_ref()),
-            color_for_percent(primary_left_percent(selected)),
+            &format_left(selected.five_hour.as_ref()),
+            color_for_percent(five_hour_left_percent(selected)),
             color_enabled,
         ),
         paint(
-            &format_left(selected.secondary.as_ref()),
+            &format_left(selected.weekly.as_ref()),
             color_for_percent(weekly_left_percent(selected)),
-            color_enabled
+            color_enabled,
         ),
     );
 }
@@ -909,15 +1197,15 @@ fn color_for_reset_credits(reset_credits: Option<u64>) -> &'static str {
 
 fn weekly_left_percent(result: &AccountProbeResult) -> f64 {
     result
-        .secondary
+        .weekly
         .as_ref()
         .map(|item| item.left_percent)
         .unwrap_or(0.0)
 }
 
-fn primary_left_percent(result: &AccountProbeResult) -> f64 {
+fn five_hour_left_percent(result: &AccountProbeResult) -> f64 {
     result
-        .primary
+        .five_hour
         .as_ref()
         .map(|item| item.left_percent)
         .unwrap_or(0.0)
@@ -1009,6 +1297,11 @@ fn compare_best_candidate(left: &AccountProbeResult, right: &AccountProbeResult)
     weekly_left_percent(left)
         .partial_cmp(&weekly_left_percent(right))
         .unwrap_or(Ordering::Equal)
+        .then_with(|| {
+            five_hour_left_percent(left)
+                .partial_cmp(&five_hour_left_percent(right))
+                .unwrap_or(Ordering::Equal)
+        })
         .then_with(|| right.auth_file.cmp(&left.auth_file))
 }
 
@@ -1016,6 +1309,7 @@ fn rank_best_candidates(results: &[AccountProbeResult]) -> Vec<&AccountProbeResu
     let mut candidates: Vec<&AccountProbeResult> = results
         .iter()
         .filter(|result| matches!(result.status, ProbeStatus::Ok))
+        .filter(|result| result.weekly.is_some())
         .collect();
     candidates.sort_by(|left, right| compare_best_candidate(right, left));
     candidates
@@ -1181,6 +1475,14 @@ fn store_account_auth(
     probe: &AccountProbeResult,
     bytes: &[u8],
 ) -> Result<PathBuf> {
+    if let Some(email) = &probe.email {
+        let path = ctx
+            .accounts_root
+            .join(format!("{}.json", sanitize_account_name(email)));
+        fs::write(&path, bytes).with_context(|| format!("failed to write {}", path.display()))?;
+        return Ok(path);
+    }
+
     let existing = discover_auth_files(ctx)?;
     if let Some(found) = existing
         .iter()
@@ -1260,7 +1562,11 @@ mod tests {
         }
     }
 
-    fn sample_result(auth_file: &str, weekly_left: f64) -> AccountProbeResult {
+    fn sample_result_with_windows(
+        auth_file: &str,
+        five_hour_left: f64,
+        weekly_left: f64,
+    ) -> AccountProbeResult {
         AccountProbeResult {
             auth_file: auth_file.to_string(),
             auth_path: PathBuf::from(format!("/tmp/{auth_file}")),
@@ -1268,10 +1574,22 @@ mod tests {
             account_label: auth_file.to_string(),
             email: Some(format!("{auth_file}@example.com")),
             plan_type: Some("plus".to_string()),
-            primary: Some(sample_window(50.0)),
-            secondary: Some(sample_window(weekly_left)),
+            five_hour: Some(sample_window(five_hour_left)),
+            weekly: Some(sample_window(weekly_left)),
             reset_credits: None,
             status: ProbeStatus::Ok,
+        }
+    }
+
+    fn sample_result(auth_file: &str, weekly_left: f64) -> AccountProbeResult {
+        sample_result_with_windows(auth_file, 50.0, weekly_left)
+    }
+
+    fn rate_limit_window(used_percent: f64, duration_mins: Option<u64>) -> RateLimitWindow {
+        RateLimitWindow {
+            used_percent,
+            window_duration_mins: duration_mins,
+            resets_at: None,
         }
     }
 
@@ -1283,6 +1601,178 @@ mod tests {
         .unwrap();
 
         assert_eq!(response.reset_credits.unwrap().available_count, 2);
+    }
+
+    #[test]
+    fn parses_switch_command_with_refresh() {
+        let cli = Cli::try_parse_from(["codex-accounts", "switch", "--refresh"]).unwrap();
+
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Switch(SwitchArgs { refresh: true }))
+        ));
+    }
+
+    #[test]
+    fn parses_polish_confirmation_answers() {
+        assert_eq!(parse_confirmation("t\n"), Some(true));
+        assert_eq!(parse_confirmation(" T "), Some(true));
+        assert_eq!(parse_confirmation("n\n"), Some(false));
+        assert_eq!(parse_confirmation(" N "), Some(false));
+        assert_eq!(parse_confirmation("y\n"), None);
+        assert_eq!(parse_confirmation("\n"), None);
+    }
+
+    #[test]
+    fn confirmation_reprompts_until_t_or_n() {
+        let mut input = std::io::Cursor::new(b"maybe\nT\n");
+        let mut output = Vec::new();
+
+        let confirmed = confirm_account_switch(&mut input, &mut output, "alpha.json").unwrap();
+        let output = String::from_utf8(output).unwrap();
+
+        assert!(confirmed);
+        assert_eq!(output.matches("[t/n]:").count(), 2);
+        assert!(output.contains("Wpisz t lub n."));
+    }
+
+    #[test]
+    fn confirmation_eof_cancels_switch() {
+        let mut input = std::io::Cursor::new(Vec::<u8>::new());
+        let mut output = Vec::new();
+
+        let confirmed = confirm_account_switch(&mut input, &mut output, "alpha.json").unwrap();
+
+        assert!(!confirmed);
+    }
+
+    #[test]
+    fn menu_line_is_padded_or_truncated_to_terminal_width() {
+        assert_eq!(
+            console::measure_text_width(&fit_menu_line("account", 12)),
+            12
+        );
+        assert_eq!(fit_menu_line("a very long account row", 10), "a very ...");
+    }
+
+    #[test]
+    fn narrow_interactive_table_keeps_both_usage_windows_visible() {
+        let results = vec![sample_result_with_windows("alpha.json", 75.0, 60.0)];
+        let table = AccountTable::new(&results);
+
+        let (header, rows) = table.interactive(78).unwrap();
+
+        assert!(header.contains("5h left"));
+        assert!(header.contains("weekly left"));
+        assert!(header.contains("status"));
+        assert!(!header.contains("5h reset"));
+        assert_eq!(console::measure_text_width(&header), 78);
+        assert_eq!(console::measure_text_width(&rows[0]), 78);
+        assert!(rows[0].contains("75%"));
+        assert!(rows[0].contains("60%"));
+    }
+
+    #[test]
+    fn wide_interactive_table_includes_all_list_columns() {
+        let results = vec![sample_result("alpha.json", 60.0)];
+        let table = AccountTable::new(&results);
+
+        let (header, _) = table.interactive(160).unwrap();
+
+        for expected in ["5h reset", "weekly reset", "resets", "status"] {
+            assert!(header.contains(expected));
+        }
+    }
+
+    #[test]
+    fn maps_primary_5h_and_secondary_weekly_windows() {
+        let snapshot = RateLimitSnapshot {
+            primary: Some(rate_limit_window(15.0, Some(FIVE_HOUR_WINDOW_MINS))),
+            secondary: Some(rate_limit_window(35.0, Some(WEEKLY_WINDOW_MINS))),
+        };
+
+        let (five_hour, weekly) = split_rate_limit_windows(snapshot);
+
+        assert_eq!(five_hour.unwrap().left_percent, 85.0);
+        assert_eq!(weekly.unwrap().left_percent, 65.0);
+    }
+
+    #[test]
+    fn maps_windows_by_duration_even_when_protocol_slots_are_swapped() {
+        let snapshot = RateLimitSnapshot {
+            primary: Some(rate_limit_window(35.0, Some(WEEKLY_WINDOW_MINS))),
+            secondary: Some(rate_limit_window(15.0, Some(FIVE_HOUR_WINDOW_MINS))),
+        };
+
+        let (five_hour, weekly) = split_rate_limit_windows(snapshot);
+
+        assert_eq!(five_hour.unwrap().left_percent, 85.0);
+        assert_eq!(weekly.unwrap().left_percent, 65.0);
+    }
+
+    #[test]
+    fn falls_back_to_primary_and_secondary_for_legacy_windows_without_duration() {
+        let snapshot = RateLimitSnapshot {
+            primary: Some(rate_limit_window(15.0, None)),
+            secondary: Some(rate_limit_window(35.0, None)),
+        };
+
+        let (five_hour, weekly) = split_rate_limit_windows(snapshot);
+
+        assert_eq!(five_hour.unwrap().left_percent, 85.0);
+        assert_eq!(weekly.unwrap().left_percent, 65.0);
+    }
+
+    #[test]
+    fn keeps_single_weekly_window_out_of_5h_column() {
+        let snapshot = RateLimitSnapshot {
+            primary: Some(rate_limit_window(35.0, Some(WEEKLY_WINDOW_MINS))),
+            secondary: None,
+        };
+
+        let (five_hour, weekly) = split_rate_limit_windows(snapshot);
+
+        assert!(five_hour.is_none());
+        assert_eq!(weekly.unwrap().left_percent, 65.0);
+    }
+
+    #[test]
+    fn does_not_label_explicit_unknown_primary_duration_as_5h() {
+        let snapshot = RateLimitSnapshot {
+            primary: Some(rate_limit_window(15.0, Some(60))),
+            secondary: Some(rate_limit_window(35.0, Some(WEEKLY_WINDOW_MINS))),
+        };
+
+        let (five_hour, weekly) = split_rate_limit_windows(snapshot);
+
+        assert!(five_hour.is_none());
+        assert_eq!(weekly.unwrap().left_percent, 65.0);
+    }
+
+    #[test]
+    fn does_not_label_explicit_unknown_secondary_duration_as_5h() {
+        let snapshot = RateLimitSnapshot {
+            primary: Some(rate_limit_window(35.0, Some(WEEKLY_WINDOW_MINS))),
+            secondary: Some(rate_limit_window(15.0, Some(30 * 24 * 60))),
+        };
+
+        let (five_hour, weekly) = split_rate_limit_windows(snapshot);
+
+        assert!(five_hour.is_none());
+        assert_eq!(weekly.unwrap().left_percent, 65.0);
+    }
+
+    #[test]
+    fn maps_remaining_durationless_window_after_exact_weekly_match() {
+        let snapshot = RateLimitSnapshot {
+            primary: Some(rate_limit_window(35.0, Some(WEEKLY_WINDOW_MINS))),
+            secondary: Some(rate_limit_window(15.0, None)),
+        };
+
+        let (five_hour, weekly) = split_rate_limit_windows(snapshot);
+
+        assert_eq!(five_hour.unwrap().left_percent, 85.0);
+        assert_eq!(weekly.unwrap().left_percent, 65.0);
     }
 
     fn lock_account(result: &AccountProbeResult, expires_at: i64, tempdir: &tempfile::TempDir) {
@@ -1311,6 +1801,19 @@ mod tests {
     }
 
     #[test]
+    fn select_best_uses_5h_limit_to_break_weekly_ties() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let ctx = sample_ctx(&tempdir);
+        let results = vec![
+            sample_result_with_windows("lower-5h.json", 20.0, 60.0),
+            sample_result_with_windows("higher-5h.json", 80.0, 60.0),
+        ];
+
+        let selected = select_best_candidate(&ctx, &results, false).unwrap();
+        assert_eq!(selected.auth_file, "higher-5h.json");
+    }
+
+    #[test]
     fn compare_results_sorts_highest_weekly_limit_first() {
         let mut results = [
             sample_result("lower.json", 20.0),
@@ -1319,6 +1822,24 @@ mod tests {
 
         results.sort_by(compare_results);
         assert_eq!(results[0].auth_file, "higher.json");
+    }
+
+    #[test]
+    fn importing_same_email_replaces_its_auth_file() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let ctx = sample_ctx(&tempdir);
+        fs::create_dir_all(&ctx.accounts_root).unwrap();
+        let probe = sample_result("ignored.json", 50.0);
+
+        let first = store_account_auth(&ctx, &probe, b"old auth").unwrap();
+        let second = store_account_auth(&ctx, &probe, b"new auth").unwrap();
+
+        assert_eq!(first, second);
+        assert_eq!(fs::read(second).unwrap(), b"new auth");
+        assert!(!ctx
+            .accounts_root
+            .join("ignored.json_at_example.com-2.json")
+            .exists());
     }
 
     #[test]
