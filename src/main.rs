@@ -952,6 +952,12 @@ fn print_table(results: &[AccountProbeResult]) {
     for (idx, result) in results.iter().enumerate() {
         println!("{}", table.row(idx, result, color_enabled));
     }
+    println!();
+    println!(
+        "Total left: 5h {} | weekly {}",
+        format_total_percent(total_five_hour_left_percent(results)),
+        format_total_percent(total_weekly_left_percent(results)),
+    );
 }
 
 fn run_interactive_switch(ctx: &AppContext, args: &SwitchArgs) -> Result<()> {
@@ -1209,6 +1215,26 @@ fn five_hour_left_percent(result: &AccountProbeResult) -> f64 {
         .as_ref()
         .map(|item| item.left_percent)
         .unwrap_or(0.0)
+}
+
+fn total_five_hour_left_percent(results: &[AccountProbeResult]) -> f64 {
+    results
+        .iter()
+        .filter_map(|result| result.five_hour.as_ref())
+        .map(|window| window.left_percent)
+        .sum()
+}
+
+fn total_weekly_left_percent(results: &[AccountProbeResult]) -> f64 {
+    results
+        .iter()
+        .filter_map(|result| result.weekly.as_ref())
+        .map(|window| window.left_percent)
+        .sum()
+}
+
+fn format_total_percent(percent: f64) -> String {
+    format!("{percent:.0}%")
 }
 
 fn truncate(text: &str, max_len: usize) -> String {
@@ -1670,6 +1696,33 @@ mod tests {
         assert_eq!(console::measure_text_width(&rows[0]), 78);
         assert!(rows[0].contains("75%"));
         assert!(rows[0].contains("60%"));
+    }
+
+    #[test]
+    fn sums_available_usage_percentages() {
+        let results = vec![
+            sample_result_with_windows("alpha.json", 75.0, 60.0),
+            sample_result_with_windows("beta.json", 125.0, 140.0),
+        ];
+
+        assert_eq!(
+            format_total_percent(total_five_hour_left_percent(&results)),
+            "200%"
+        );
+        assert_eq!(
+            format_total_percent(total_weekly_left_percent(&results)),
+            "200%"
+        );
+    }
+
+    #[test]
+    fn excludes_missing_usage_windows_from_totals() {
+        let mut result = sample_result_with_windows("alpha.json", 75.0, 60.0);
+        result.weekly = None;
+        let results = vec![result];
+
+        assert_eq!(total_five_hour_left_percent(&results), 75.0);
+        assert_eq!(total_weekly_left_percent(&results), 0.0);
     }
 
     #[test]
