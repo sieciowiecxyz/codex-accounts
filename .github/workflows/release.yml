@@ -61,7 +61,7 @@ jobs:
           mkdir -p "$package_dir"
           cp dist/codex-accounts dist/LICENSE PKGBUILD "$package_dir/"
           sed -i "s/^pkgver=.*/pkgver=${version}/" "$package_dir/PKGBUILD"
-          docker run --rm -v "$package_dir:/build" archlinux:base-devel bash -c 'pacman -Sy --noconfirm archlinux-keyring && cd /build && makepkg --nodeps --noconfirm'
+          docker run --rm -v "$package_dir:/build" archlinux:base-devel bash -c 'pacman -Sy --noconfirm archlinux-keyring && useradd -m builder && chown -R builder:builder /build && su builder -c "cd /build && makepkg --nodeps --noconfirm"'
           cp "$package_dir"/*.pkg.tar.zst dist/packages/
           sha256sum dist/packages/* > dist/packages/SHA256SUMS
       - uses: actions/upload-artifact@v4
