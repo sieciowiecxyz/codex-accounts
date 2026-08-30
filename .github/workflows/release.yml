@@ -1,0 +1,71 @@
+name: Codex Accounts CI
+on:
+  pull_request:
+  push:
+    branches: [main]
+    tags: ['v*']
+  workflow_dispatch:
+permissions:
+  contents: read
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo fmt --all -- --check
+      - run: cargo check --locked
+      - run: cargo test --locked
+  build:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: checks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with: { targets: x86_64-unknown-linux-gnu }
+      - name: Build optimized binary
+        env: { RUSTFLAGS: -C target-cpu=native }
+        run: cargo build --release --locked --target x86_64-unknown-linux-gnu
+      - run: |
+          mkdir -p dist
+          cp target/x86_64-unknown-linux-gnu/release/codex-accounts dist/codex-accounts
+          cp LICENSE dist/LICENSE
+          sha256sum dist/codex-accounts > dist/codex-accounts.sha256
+      - uses: actions/upload-artifact@v4
+        with: { name: codex-accounts-linux-x86_64, path: dist }
+  packages:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions: { contents: write }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with: { name: codex-accounts-linux-x86_64, path: dist }
+      - name: Build RPM and Arch package
+        run: |
+          sudo apt-get update && sudo apt-get install -y rpm
+          version="${GITHUB_REF_NAME#v}"
+          spec_dir="${RUNNER_TEMP}/rpmbuild"
+          mkdir -p "$spec_dir"/{BUILD,BUILDROOT,RPMS,SOURCES,SPECS,SRPMS}
+          cp dist/codex-accounts dist/LICENSE "$spec_dir/SOURCES/"
+          sed "s/^Version:.*/Version:        ${version}/" packaging/fedora/codex-accounts.spec > "$spec_dir/SPECS/codex-accounts.spec"
+          rpmbuild -bb "$spec_dir/SPECS/codex-accounts.spec" --define "_topdir $spec_dir" --define "_rpmdir ${RUNNER_TEMP}/rpm-out"
+          mkdir -p dist/packages
+          find "${RUNNER_TEMP}/rpm-out" -name '*.rpm' -exec cp {} dist/packages/ \;
+          package_dir="${RUNNER_TEMP}/arch-package"
+          mkdir -p "$package_dir"
+          cp dist/codex-accounts dist/LICENSE PKGBUILD "$package_dir/"
+          sed -i "s/^pkgver=.*/pkgver=${version}/" "$package_dir/PKGBUILD"
+          docker run --rm -v "$package_dir:/build" archlinux:base-devel bash -c 'pacman -Sy --noconfirm archlinux-keyring && cd /build && makepkg --nodeps --noconfirm'
+          cp "$package_dir"/*.pkg.tar.zst dist/packages/
+          sha256sum dist/packages/* > dist/packages/SHA256SUMS
+      - uses: actions/upload-artifact@v4
+        with: { name: codex-accounts-linux-packages, path: dist/packages }
+      - name: Publish GitHub Release
+        env: { GH_TOKEN: "${{ github.token }}" }
+        run: gh release create "$GITHUB_REF_NAME" dist/codex-accounts dist/codex-accounts.sha256 dist/packages/* --repo "$GITHUB_REPOSITORY" --generate-notes
