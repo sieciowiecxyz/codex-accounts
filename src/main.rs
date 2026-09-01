@@ -19,7 +19,7 @@ use tempfile::Builder;
 use tungstenite::{client, Message, WebSocket};
 
 const CACHE_TTL_SECS: i64 = 45;
-const PROBE_TIMEOUT_SECS: u64 = 8;
+const PROBE_TIMEOUT_SECS: u64 = 30;
 const MAX_CONCURRENCY: usize = 4;
 const USE_BEST_LOCK_TTL_SECS: u64 = 300;
 const FIVE_HOUR_WINDOW_MINS: u64 = 5 * 60;
