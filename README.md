@@ -50,7 +50,9 @@ What happens:
 3. the new auth is stored as `~/.codex/accounts/<email>.json`
 4. the new auth becomes active only after it was stored successfully
 
-Logging in again with the same email replaces that email's stored auth instead of creating a `-2.json` duplicate.
+The current active auth is preserved before every import. If the same email has different
+credentials (for example another workspace or session), the existing file is kept and the
+new one gets a `-2.json` suffix instead of overwriting it.
 
 Example stored names:
 

@@ -1461,10 +1461,21 @@ fn remove_selected(selected: &AccountProbeResult) -> Result<()> {
 }
 
 fn import_new_account(ctx: &AppContext) -> Result<PathBuf> {
+    preserve_current_auth(ctx)?;
     let login_home = Builder::new()
         .prefix("import-")
         .tempdir_in(&ctx.tmp_root)
         .with_context(|| format!("failed to create temp dir in {}", ctx.tmp_root.display()))?;
+    fs::write(
+        login_home.path().join("config.toml"),
+        "cli_auth_credentials_store = \"file\"\n",
+    )
+    .with_context(|| {
+        format!(
+            "failed to configure isolated Codex home {}",
+            login_home.path().display()
+        )
+    })?;
     let status = Command::new("codex")
         .arg("login")
         .env("CODEX_HOME", login_home.path())
@@ -1496,25 +1507,58 @@ fn import_new_account(ctx: &AppContext) -> Result<PathBuf> {
     Ok(stored_path)
 }
 
+fn preserve_current_auth(ctx: &AppContext) -> Result<()> {
+    let current_path = ctx.codex_root.join("auth.json");
+    let bytes = match fs::read(&current_path) {
+        Ok(bytes) => bytes,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(err) => {
+            return Err(err).with_context(|| format!("failed to read {}", current_path.display()))
+        }
+    };
+
+    if discover_auth_files(ctx)?
+        .iter()
+        .any(|entry| entry.path.starts_with(&ctx.accounts_root) && entry.bytes == bytes)
+    {
+        return Ok(());
+    }
+
+    let mut candidate = ctx.accounts_root.join("active.json");
+    let mut suffix = 2u32;
+    while candidate.exists() {
+        candidate = ctx.accounts_root.join(format!("active-{suffix}.json"));
+        suffix += 1;
+    }
+    fs::write(&candidate, bytes)
+        .with_context(|| format!("failed to preserve current auth in {}", candidate.display()))?;
+    Ok(())
+}
+
 fn store_account_auth(
     ctx: &AppContext,
     probe: &AccountProbeResult,
     bytes: &[u8],
 ) -> Result<PathBuf> {
-    if let Some(email) = &probe.email {
-        let path = ctx
-            .accounts_root
-            .join(format!("{}.json", sanitize_account_name(email)));
-        fs::write(&path, bytes).with_context(|| format!("failed to write {}", path.display()))?;
-        return Ok(path);
-    }
-
     let existing = discover_auth_files(ctx)?;
     if let Some(found) = existing
         .iter()
         .find(|entry| entry.path.starts_with(&ctx.accounts_root) && entry.bytes == bytes)
     {
         return Ok(found.path.clone());
+    }
+
+    if let Some(email) = &probe.email {
+        let base_name = sanitize_account_name(email);
+        let mut candidate = ctx.accounts_root.join(format!("{base_name}.json"));
+        let mut suffix = 2u32;
+        while candidate.exists() {
+            candidate = ctx.accounts_root.join(format!("{base_name}-{suffix}.json"));
+            suffix += 1;
+        }
+        fs::write(&candidate, bytes)
+            .with_context(|| format!("failed to write {}", candidate.display()))?;
+        return Ok(candidate);
     }
 
     let label = probe.email.as_deref().unwrap_or(&probe.account_label);
@@ -1878,7 +1922,7 @@ mod tests {
     }
 
     #[test]
-    fn importing_same_email_replaces_its_auth_file() {
+    fn importing_same_email_preserves_existing_auth_file() {
         let tempdir = tempfile::tempdir().unwrap();
         let ctx = sample_ctx(&tempdir);
         fs::create_dir_all(&ctx.accounts_root).unwrap();
@@ -1887,12 +1931,10 @@ mod tests {
         let first = store_account_auth(&ctx, &probe, b"old auth").unwrap();
         let second = store_account_auth(&ctx, &probe, b"new auth").unwrap();
 
-        assert_eq!(first, second);
-        assert_eq!(fs::read(second).unwrap(), b"new auth");
-        assert!(!ctx
-            .accounts_root
-            .join("ignored.json_at_example.com-2.json")
-            .exists());
+        assert_ne!(first, second);
+        assert_eq!(fs::read(&first).unwrap(), b"old auth");
+        assert_eq!(fs::read(&second).unwrap(), b"new auth");
+        assert!(second.ends_with("ignored.json_at_example.com-2.json"));
     }
 
     #[test]
