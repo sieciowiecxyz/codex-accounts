@@ -11,11 +11,11 @@ use anyhow::{anyhow, bail, Context, Result};
 use chrono::{Local, TimeZone};
 use clap::{Args, Parser, Subcommand};
 use console::{pad_str, Alignment, Style, Term};
-use dialoguer::{theme::ColorfulTheme, Select};
+use dialoguer::{theme::ColorfulTheme, Confirm, Select};
 use rayon::prelude::*;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::{json, Value};
-use tempfile::Builder;
+use tempfile::{Builder, NamedTempFile};
 use tungstenite::{client, Message, WebSocket};
 
 const CACHE_TTL_SECS: i64 = 45;
@@ -565,6 +565,9 @@ fn probe_single_auth_inner(ctx: &AppContext, auth_file: &AuthFile) -> Result<Acc
     };
 
     let _ = websocket.close(None);
+    drop(websocket);
+    drop(child);
+    persist_refreshed_auth(auth_file, &temp_dir.path().join("auth.json"))?;
 
     Ok(AccountProbeResult {
         auth_file: auth_file_name(&auth_file.path),
@@ -578,6 +581,63 @@ fn probe_single_auth_inner(ctx: &AppContext, auth_file: &AuthFile) -> Result<Acc
         reset_credits,
         status: ProbeStatus::Ok,
     })
+}
+
+fn persist_refreshed_auth(auth_file: &AuthFile, probed_auth_path: &Path) -> Result<()> {
+    let refreshed = fs::read(probed_auth_path)
+        .with_context(|| format!("failed to read probed auth {}", probed_auth_path.display()))?;
+    if refreshed == auth_file.bytes {
+        return Ok(());
+    }
+
+    let current = fs::read(&auth_file.path)
+        .with_context(|| format!("failed to read {}", auth_file.path.display()))?;
+    if current != auth_file.bytes {
+        bail!(
+            "{} changed while its auth was being probed",
+            auth_file.path.display()
+        );
+    }
+
+    let parent = auth_file
+        .path
+        .parent()
+        .ok_or_else(|| anyhow!("{} has no parent directory", auth_file.path.display()))?;
+    let metadata = fs::metadata(&auth_file.path)
+        .with_context(|| format!("failed to inspect {}", auth_file.path.display()))?;
+    let mut temp_file = NamedTempFile::new_in(parent)
+        .with_context(|| format!("failed to create temp auth in {}", parent.display()))?;
+    temp_file
+        .as_file()
+        .set_permissions(metadata.permissions())
+        .with_context(|| {
+            format!(
+                "failed to preserve permissions for {}",
+                auth_file.path.display()
+            )
+        })?;
+    temp_file.write_all(&refreshed).with_context(|| {
+        format!(
+            "failed to write refreshed auth for {}",
+            auth_file.path.display()
+        )
+    })?;
+    temp_file.as_file().sync_all().with_context(|| {
+        format!(
+            "failed to flush refreshed auth for {}",
+            auth_file.path.display()
+        )
+    })?;
+    temp_file
+        .persist(&auth_file.path)
+        .map_err(|error| error.error)
+        .with_context(|| {
+            format!(
+                "failed to replace {} with refreshed auth",
+                auth_file.path.display()
+            )
+        })?;
+    Ok(())
 }
 
 fn reserve_port() -> Result<u16> {
@@ -992,6 +1052,20 @@ fn run_interactive_switch(ctx: &AppContext, args: &SwitchArgs) -> Result<()> {
         "Switched to {} ({})",
         selected.auth_file, selected.account_label
     );
+    if Confirm::new()
+        .with_prompt("Execute `codex app-server daemon restart`?")
+        .default(false)
+        .interact()
+        .context("failed to read daemon restart confirmation")?
+    {
+        let status = Command::new("codex")
+            .args(["app-server", "daemon", "restart"])
+            .status()
+            .context("failed to execute `codex app-server daemon restart`")?;
+        if !status.success() {
+            bail!("`codex app-server daemon restart` failed with {status}");
+        }
+    }
     Ok(())
 }
 
